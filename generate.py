@@ -15,7 +15,13 @@ Options:
                     Y = 64 + round(elevation_m * F).
                     Suggested values:  0.10 (subtle), 0.15 (moderate), 0.20 (dramatic).
     --biomes MODE   'default' = plains everywhere, 'elevation' = biome by height (default).
-    --spawn NAME    Named spawn point (default 'ben_lomond').
+    --spawn LAT,LON Spawn at a WGS84 geo coordinate (e.g. '56.97,-3.40').
+                    Falls back to map centre if the point is outside the map.
+    --void          Keep the void boundary beyond the pre-filled OS area.
+                    Triggers Minecraft's 'Experimental Settings' warning.
+    --buildings     Detect OS light-orange building fill from the raster tiles
+                    and place stacks of bricks on those cells. Auto-off below
+                    --scale 8 (each cell resolves to <1 block).
     --out PATH      Output world folder (default ./worlds/<NAME>).
 """
 
@@ -39,6 +45,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 from heightmap import parse_asc
+from locate import wgs84_to_bng
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -58,7 +65,15 @@ TIFF_PX_PER_M        = 1       # OS tiles are 1 m/pixel, so 50 px per 50 m cell
 TIFF_WATER_THRESHOLD = 0.5     # fraction of blue pixels per cell to mark as water
 FLAT_WINDOW          = 5       # cells; 5 x 50 m = 250 m flat-area detector
 FLAT_RANGE_M         = 0.05    # cells in window must vary less than this to be "flat"
-WATER_MASK_THRESHOLD = 0.55    # threshold for bilinear-sampled water density (scale > 1)
+WATER_MASK_THRESHOLD = 0.50    # threshold for bilinear-sampled water density (scale > 1)
+
+# Building detection tuning (requires --buildings; auto-off below MIN_BUILDING_SCALE)
+TIFF_BUILDING_THRESHOLD = 0.30  # fraction of peach pixels per sub-cell to mark as building
+BUILDING_SUBCELL_M      = 5     # m; building mask resolution — 10x finer than CELL_SIZE_M
+                                #     so buildings render close to street level instead of
+                                #     occupying whole 50 m OS cells.
+BUILDING_HEIGHT_BLOCKS  = 3     # stack of 'bricks' blocks placed above the surface
+MIN_BUILDING_SCALE      = 8     # cells below this resolve buildings as <1 block — skip
 
 # Block palette — elevation thresholds (metres) for surface/sub-surface selection
 THRESHOLDS = [
@@ -210,12 +225,35 @@ def _is_water_color(r, g, b):
 
 def _tile_water_fraction(tif_path, cell_size_px):
     """Read a palette TIFF quadrant and return fraction-of-water per cell grid."""
+    return _tile_palette_fraction(tif_path, cell_size_px, _is_water_color)
+
+
+def _is_building_color(r, g, b):
+    """True if an OS raster palette entry is the light-peach building fill.
+
+    Calibrated against OS Explorer raster tiles: the building fill is
+    #f8d8b8 — RGB (248, 216, 184). Tight tolerances are enough because the
+    palette maps exactly to that entry on every tile.
+    """
+    return (abs(r - 248) <= 8
+            and abs(g - 216) <= 8
+            and abs(b - 184) <= 8
+            and r > g > b)
+
+
+def _tile_building_fraction(tif_path, cell_size_px):
+    """Read a palette TIFF quadrant and return fraction-of-building per cell grid."""
+    return _tile_palette_fraction(tif_path, cell_size_px, _is_building_color)
+
+
+def _tile_palette_fraction(tif_path, cell_size_px, predicate):
+    """Shared helper: fraction of palette-matching pixels per cell_size_px block."""
     im = Image.open(tif_path)
     pal = im.getpalette() or []
     arr = np.asarray(im, dtype=np.uint8)
     lut = np.zeros(256, dtype=bool)
     for idx in range(min(256, len(pal) // 3)):
-        if _is_water_color(pal[idx * 3], pal[idx * 3 + 1], pal[idx * 3 + 2]):
+        if predicate(pal[idx * 3], pal[idx * 3 + 1], pal[idx * 3 + 2]):
             lut[idx] = True
     mask = lut[arr]
     h, w = mask.shape
@@ -301,6 +339,73 @@ def load_water_mask(zip_entries, grid, min_east, max_north, tiles_dir,
 
     n_water = int(mask.sum())
     print(f"Water cells: {n_water:,} / {mask.size:,}  ({100 * n_water / mask.size:.1f}%)")
+    return mask
+
+
+def load_building_mask(zip_entries, grid, min_east, max_north, tiles_dir,
+                       tiff_threshold=TIFF_BUILDING_THRESHOLD):
+    """
+    Build a boolean building mask from the OS raster TIFFs, at BUILDING_SUBCELL_M
+    resolution (10x denser than the elevation grid). A sub-cell is flagged when
+    the fraction of peach (#f8d8b8) pixels within its
+    BUILDING_SUBCELL_M x BUILDING_SUBCELL_M footprint exceeds `tiff_threshold`.
+
+    Shape: (grid_rows * K, grid_cols * K) where K = CELL_SIZE_M // BUILDING_SUBCELL_M.
+    """
+    grid_rows, grid_cols = grid.shape
+    K = CELL_SIZE_M // BUILDING_SUBCELL_M
+    mask = np.zeros((grid_rows * K, grid_cols * K), dtype=bool)
+
+    if not (tiles_dir and os.path.isdir(tiles_dir)):
+        print("Skipping building detection (tiles directory not found).")
+        return mask
+
+    print(f"Detecting buildings from map TIFFs in {tiles_dir} "
+          f"(sub-cell {BUILDING_SUBCELL_M} m)...")
+    subcell_px = BUILDING_SUBCELL_M * TIFF_PX_PER_M
+    missing = 0
+    for zp, e_digit, n_digit, region in tqdm(zip_entries, unit="tile"):
+        try:
+            hdr, _ = _load_zip(zp)
+        except Exception:
+            continue
+        ncols, nrows = int(hdr["ncols"]), int(hdr["nrows"])
+        col_offset = round((hdr["xllcorner"] - min_east) / CELL_SIZE_M)
+        row_offset = round((max_north - (hdr["yllcorner"] + nrows * CELL_SIZE_M)) / CELL_SIZE_M)
+
+        tile_code = f"{region.upper()}{e_digit}{n_digit}"
+        region_up = region.upper()
+        half_rows, half_cols = nrows // 2, ncols // 2
+        quadrants = [
+            ("NW", 0,         0),
+            ("NE", 0,         half_cols),
+            ("SW", half_rows, 0),
+            ("SE", half_rows, half_cols),
+        ]
+        for quad, q_row, q_col in quadrants:
+            tif_path = os.path.join(tiles_dir, region_up, f"{tile_code}{quad}.tif")
+            if not os.path.isfile(tif_path):
+                missing += 1
+                continue
+            try:
+                frac = _tile_building_fraction(tif_path, cell_size_px=subcell_px)
+            except Exception as ex:
+                tqdm.write(f"  Warning: {os.path.basename(tif_path)}: {ex}")
+                continue
+            qh, qw = frac.shape   # in sub-cells
+            # Quadrant offset in sub-cells from the global origin
+            r0 = (row_offset + q_row) * K
+            c0 = (col_offset + q_col) * K
+            r1 = min(r0 + qh, grid_rows * K)
+            c1 = min(c0 + qw, grid_cols * K)
+            if r1 > r0 and c1 > c0:
+                mask[r0:r1, c0:c1] |= frac[:r1 - r0, :c1 - c0] > tiff_threshold
+    if missing:
+        print(f"  ({missing} quadrant TIFFs missing — OK if the area is off-coverage)")
+
+    n_bld = int(mask.sum())
+    print(f"Building sub-cells: {n_bld:,} / {mask.size:,}  "
+          f"({100 * n_bld / mask.size:.2f}%)")
     return mask
 
 
@@ -487,6 +592,7 @@ def _make_palette(level):
         "gravel":   to_uni("gravel"),
         "snow":     to_uni("snow_block"),
         "water":    to_uni("water", {"level": "0"}),
+        "bricks":   to_uni("bricks"),
     }
 
 
@@ -521,6 +627,7 @@ ARRAY_HEIGHT = Y_MAX - Y_MIN + 1  # = 384
 
 def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
                    water_mask=None, water_density=None,
+                   building_mask=None,
                    mc_width=None, mc_depth=None):
     """
     Build and return an amulet Chunk for chunk coordinates (cx, cz).
@@ -528,6 +635,11 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
 
     If `water_mask` is given, cells where it is True have their top block
     replaced with water (lochs get a single water block at the loch surface).
+
+    If `building_mask` is given (at BUILDING_SUBCELL_M resolution — 10x denser
+    than `grid`), blocks whose footprint maps to a flagged sub-cell get a
+    short stack of bricks (BUILDING_HEIGHT_BLOCKS blocks) placed above the
+    surface. Buildings lose to water: blocks flagged as both stay water.
 
     If `mc_width`/`mc_depth` are given, edge columns that contain water are
     capped with stone up to one block above the local water level — just
@@ -548,6 +660,7 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
     SNOW_ID    = ids["snow"]
     GRASS_ID   = ids["grass"]
     WATER_ID   = ids["water"]
+    BRICKS_ID  = ids["bricks"]
 
     surf_ids = {
         "snow":   SNOW_ID,
@@ -618,6 +731,17 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
                     water_mask is not None and bool(water_mask[cell_row, cell_col])
                 )
 
+            # Buildings use a separate sub-cell mask (BUILDING_SUBCELL_M).
+            # Nearest-neighbour lookup per block — no bilinear blur, so
+            # isolated buildings stay crisp instead of merging into blocks.
+            is_mask_building_cell = False
+            if in_bounds and building_mask is not None:
+                mr, mc = building_mask.shape
+                sub_col = int((gx + 0.5) * CELL_SIZE_M / (scale * BUILDING_SUBCELL_M))
+                sub_row = int((gz + 0.5) * CELL_SIZE_M / (scale * BUILDING_SUBCELL_M))
+                if 0 <= sub_row < mr and 0 <= sub_col < mc:
+                    is_mask_building_cell = bool(building_mask[sub_row, sub_col])
+
             biome_elevs[lx, lz] = elev
 
             y_surf = int(round(MAP_ZERO_Y + elev * vscale))
@@ -665,6 +789,17 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
                     and elev > 0
                     and 0 <= arr_surf < ARRAY_HEIGHT):
                 col_blocks[lx, arr_surf, lz] = WATER_ID
+
+            # --- Buildings: stack bricks above the surface ---
+            # Skip if this cell was flagged as water (building detector can
+            # touch harbours / river banks). Only on land (elev > 0).
+            if (is_mask_building_cell
+                    and not is_mask_water_cell
+                    and elev > 0):
+                bld_start = arr_surf + 1
+                bld_end   = min(ARRAY_HEIGHT, bld_start + BUILDING_HEIGHT_BLOCKS)
+                if bld_end > bld_start:
+                    col_blocks[lx, bld_start:bld_end, lz] = BRICKS_ID
 
             # --- Perimeter rim: only where water reaches the world edge ---
             if (mc_width is not None and mc_depth is not None
@@ -784,23 +919,87 @@ def write_entity_files(world_path, cx_min, cx_max, cz_min, cz_max):
 
 
 def _void_flat_generator(biome="minecraft:plains"):
-    """Return NBT CompoundTag for a flat/void dimension generator."""
+    """Return a flat/void generator compound.
+
+    Triggers Minecraft's "Worlds using Experimental Settings are not
+    supported" warning on load because inline flat-generator settings are
+    treated as custom worldgen. Only used when the user passes --void to
+    opt into that warning in exchange for keeping the void boundary beyond
+    the pre-filled OS area.
+    """
     return amulet_nbt.CompoundTag({
         "type": amulet_nbt.StringTag("minecraft:flat"),
         "settings": amulet_nbt.CompoundTag({
             "biome": amulet_nbt.StringTag(biome),
             "features": amulet_nbt.ByteTag(0),
             "lakes": amulet_nbt.ByteTag(0),
-            "layers": amulet_nbt.ListTag([]),
-            "structure_overrides": amulet_nbt.ListTag([]),
+            "layers": amulet_nbt.ListTag([
+                amulet_nbt.CompoundTag({
+                    "block":  amulet_nbt.StringTag("minecraft:air"),
+                    "height": amulet_nbt.IntTag(1),
+                })
+            ]),
         }),
     })
 
 
-def patch_level_dat(world_path, world_name, mc_x, mc_y, mc_z):
+def _vanilla_generator(dim):
+    """Return the vanilla noise generator for a standard dimension.
+
+    Uses preset references ("minecraft:overworld", "minecraft:nether",
+    "minecraft:the_end") so WorldGenSettings exactly matches the shape
+    Minecraft writes for a default-created world. Any inline custom
+    worldgen (flat with custom layers, custom biome sources, etc.) is
+    treated by Minecraft's Codec as a custom dimension and permanently
+    flags the world as experimental — which surfaces the
+    "Worlds using Experimental Settings are not supported" warning on
+    every load, even after the user upgrades the world.
+
+    Tradeoff: chunks beyond our pre-filled OS area will fill with vanilla
+    terrain instead of void. The pre-filled chunks themselves load as-is
+    from the region files and are not affected.
+    """
+    if dim == "minecraft:overworld":
+        return amulet_nbt.CompoundTag({
+            "type": amulet_nbt.StringTag("minecraft:noise"),
+            "biome_source": amulet_nbt.CompoundTag({
+                "type":   amulet_nbt.StringTag("minecraft:multi_noise"),
+                "preset": amulet_nbt.StringTag("minecraft:overworld"),
+            }),
+            "settings": amulet_nbt.StringTag("minecraft:overworld"),
+        })
+    if dim == "minecraft:the_nether":
+        return amulet_nbt.CompoundTag({
+            "type": amulet_nbt.StringTag("minecraft:noise"),
+            "biome_source": amulet_nbt.CompoundTag({
+                "type":   amulet_nbt.StringTag("minecraft:multi_noise"),
+                "preset": amulet_nbt.StringTag("minecraft:nether"),
+            }),
+            "settings": amulet_nbt.StringTag("minecraft:nether"),
+        })
+    if dim == "minecraft:the_end":
+        return amulet_nbt.CompoundTag({
+            "type": amulet_nbt.StringTag("minecraft:noise"),
+            "biome_source": amulet_nbt.CompoundTag({
+                "type": amulet_nbt.StringTag("minecraft:the_end"),
+            }),
+            "settings": amulet_nbt.StringTag("minecraft:end"),
+        })
+    raise ValueError(f"Unknown dimension: {dim}")
+
+
+def patch_level_dat(world_path, world_name, mc_x, mc_y, mc_z, void=False):
     """
     Replace the minimal amulet-generated level.dat with a complete, valid one
     that Minecraft 1.21.x will accept.
+
+    void=False (default): references the vanilla noise generators so
+    Minecraft treats the world as a standard one (no experimental warning).
+    Chunks beyond the pre-filled area get vanilla terrain.
+
+    void=True: writes inline flat-void generators so areas beyond the
+    pre-filled map stay as void. Minecraft will show the
+    "Worlds using Experimental Settings are not supported" warning.
     """
     dat_path = os.path.join(world_path, "level.dat")
     nbt = amulet_nbt.load(dat_path)
@@ -835,9 +1034,32 @@ def patch_level_dat(world_path, world_name, mc_x, mc_y, mc_z):
         "Snapshot": amulet_nbt.ByteTag(0),
     })
 
-    # --- WorldGenSettings (the missing piece that caused the crash) ---
-    # We use void flat generators so Minecraft doesn't try to terrain-gen new chunks
-    # on top of our pre-filled area.
+    # --- DataPacks / enabled_features (suppress "Experimental Settings" warning) ---
+    # Amulet's default level.dat enables experimental datapacks (bundle,
+    # trade_rebalance, etc.) which causes Minecraft 1.21 to show
+    # "Worlds using Experimental Settings are not supported" on load.
+    # Force a vanilla-only configuration.
+    # Empty Disabled list must be typed as string (tag id 8); amulet_nbt
+    # defaults an untyped empty ListTag to byte (1), which Minecraft's
+    # DataPacks codec rejects.
+    data["DataPacks"] = amulet_nbt.CompoundTag({
+        "Enabled":  amulet_nbt.ListTag([amulet_nbt.StringTag("vanilla")]),
+        "Disabled": amulet_nbt.ListTag([], 8),
+    })
+    data["enabled_features"] = amulet_nbt.ListTag(
+        [amulet_nbt.StringTag("minecraft:vanilla")]
+    )
+
+    # --- WorldGenSettings ---
+    if void:
+        overworld_gen = _void_flat_generator("minecraft:plains")
+        nether_gen    = _void_flat_generator("minecraft:nether_wastes")
+        end_gen       = _void_flat_generator("minecraft:the_end")
+    else:
+        overworld_gen = _vanilla_generator("minecraft:overworld")
+        nether_gen    = _vanilla_generator("minecraft:the_nether")
+        end_gen       = _vanilla_generator("minecraft:the_end")
+
     data["WorldGenSettings"] = amulet_nbt.CompoundTag({
         "bonus_chest":       amulet_nbt.ByteTag(0),
         "generate_features": amulet_nbt.ByteTag(0),
@@ -845,15 +1067,15 @@ def patch_level_dat(world_path, world_name, mc_x, mc_y, mc_z):
         "dimensions": amulet_nbt.CompoundTag({
             "minecraft:overworld": amulet_nbt.CompoundTag({
                 "type":      amulet_nbt.StringTag("minecraft:overworld"),
-                "generator": _void_flat_generator("minecraft:plains"),
+                "generator": overworld_gen,
             }),
             "minecraft:the_nether": amulet_nbt.CompoundTag({
                 "type":      amulet_nbt.StringTag("minecraft:the_nether"),
-                "generator": _void_flat_generator("minecraft:nether_wastes"),
+                "generator": nether_gen,
             }),
             "minecraft:the_end": amulet_nbt.CompoundTag({
                 "type":      amulet_nbt.StringTag("minecraft:the_end"),
-                "generator": _void_flat_generator("minecraft:the_end"),
+                "generator": end_gen,
             }),
         }),
     })
@@ -872,11 +1094,22 @@ def main():
     parser.add_argument("--vscale",  type=float, default=0.10,       help="Vertical scale multiplier (default 0.10)")
     parser.add_argument("--biomes",  choices=["default", "elevation"], default="elevation",
                                                                       help="Biome mode (default: elevation)")
+    parser.add_argument("--spawn",   default=None, metavar="LAT,LON",
+                        help="Spawn at a WGS84 geo coord 'lat,lon' (e.g. '56.97,-3.40'). "
+                             "Falls back to map centre if the point is outside the map.")
+    parser.add_argument("--void", action="store_true",
+                        help="Keep the void boundary beyond the pre-filled OS area. "
+                             "Minecraft will show the 'Worlds using Experimental Settings "
+                             "are not supported' warning on load (default: vanilla terrain, "
+                             "no warning).")
     parser.add_argument("--out",     default=None,                   help="Output world folder")
     parser.add_argument("--no-water", action="store_true",
                         help="Skip inland water detection and perimeter rim.")
     parser.add_argument("--no-rivers", action="store_true",
                         help="Skip OS Open Rivers rasterization (auto-off at scale < 4).")
+    parser.add_argument("--buildings", action="store_true",
+                        help="Detect light-orange building fill from OS raster TIFFs and "
+                             f"place bricks on those cells (auto-off at scale < {MIN_BUILDING_SCALE}).")
     parser.add_argument("--tiles-dir", default=None,
                         help="Path to OS raster tiles root (default: '<input-parent>/../tiles').")
     parser.add_argument("--rivers-path", default=None,
@@ -905,15 +1138,17 @@ def main():
     grid, origin_easting, origin_northing_top = load_elevation_grid(zip_entries)
     grid_rows, grid_cols = grid.shape
 
+    # --- Resolve tiles dir (shared by water + buildings detection) ---
+    # Default tiles dir is a sibling of the data folder: .../OS Map Data/tiles
+    if args.tiles_dir:
+        tiles_dir = args.tiles_dir
+    else:
+        first_zip_dir = os.path.dirname(zip_entries[0][0])
+        tiles_dir = os.path.normpath(os.path.join(first_zip_dir, "..", "..", "tiles"))
+
     # --- Load water mask ---
     water_mask = None
     if not args.no_water:
-        # Default tiles dir is a sibling of the data folder: .../OS Map Data/tiles
-        if args.tiles_dir:
-            tiles_dir = args.tiles_dir
-        else:
-            first_zip_dir = os.path.dirname(zip_entries[0][0])
-            tiles_dir = os.path.normpath(os.path.join(first_zip_dir, "..", "..", "tiles"))
         water_mask = load_water_mask(zip_entries, grid, origin_easting,
                                      origin_northing_top, tiles_dir)
 
@@ -957,6 +1192,18 @@ def main():
         if river_mask is not None:
             water_density[river_mask] = 1.0
 
+    # --- Load building mask ---
+    # Auto-off below MIN_BUILDING_SCALE because a 50 m cell resolves to <1 block,
+    # so individual buildings are smaller than the block grid.
+    building_mask = None
+    if args.buildings:
+        if args.scale < MIN_BUILDING_SCALE:
+            print(f"Skipping buildings (--scale {args.scale} < {MIN_BUILDING_SCALE} "
+                  "— each cell resolves to <1 block).")
+        else:
+            building_mask = load_building_mask(zip_entries, grid, origin_easting,
+                                               origin_northing_top, tiles_dir)
+
     # --- Create world ---
     print(f"\nCreating world: {world_name}")
     fmt = AnvilFormat(out_path)
@@ -990,6 +1237,7 @@ def main():
                     biome_mode=args.biomes,
                     water_mask=water_mask,
                     water_density=water_density,
+                    building_mask=building_mask,
                     mc_width=mc_width,
                     mc_depth=mc_depth,
                 )
@@ -1005,14 +1253,33 @@ def main():
     write_entity_files(out_path, cx_min, cx_max, cz_min, cz_max)
 
     # --- Patch level.dat (fix WorldGenSettings + spawn) ---
-    # Spawn at the centre of the map, 1 block above the actual surface there
-    centre_col = grid_cols // 2
-    centre_row = grid_rows // 2
-    centre_elev = float(grid[centre_row, centre_col])
-    spawn_x = (centre_col * args.scale) + (args.scale // 2)
-    spawn_z = (centre_row * args.scale) + (args.scale // 2)
-    spawn_y = MAP_ZERO_Y + round(centre_elev * args.vscale) + 1
-    patch_level_dat(out_path, world_name, spawn_x, spawn_y, spawn_z)
+    # Default spawn: centre of the map. --spawn overrides with a WGS84 coord.
+    spawn_col = grid_cols // 2
+    spawn_row = grid_rows // 2
+
+    if args.spawn:
+        try:
+            lat_s, lon_s = args.spawn.split(",")
+            lat, lon = float(lat_s), float(lon_s)
+        except ValueError:
+            print(f"--spawn: could not parse '{args.spawn}' — expected 'lat,lon'. "
+                  "Using map centre.")
+        else:
+            east, north = wgs84_to_bng(lat, lon)
+            col = int((east - origin_easting) / CELL_SIZE_M)
+            row = int((origin_northing_top - north) / CELL_SIZE_M)
+            if 0 <= col < grid_cols and 0 <= row < grid_rows:
+                spawn_col, spawn_row = col, row
+                print(f"Spawn set from {lat}, {lon} → grid cell ({col}, {row}).")
+            else:
+                print(f"Spawn coord {lat}, {lon} (BNG {east:.0f}E {north:.0f}N) "
+                      f"is outside the generated map — using map centre.")
+
+    spawn_elev = float(grid[spawn_row, spawn_col])
+    spawn_x = (spawn_col * args.scale) + (args.scale // 2)
+    spawn_z = (spawn_row * args.scale) + (args.scale // 2)
+    spawn_y = MAP_ZERO_Y + round(spawn_elev * args.vscale) + 1
+    patch_level_dat(out_path, world_name, spawn_x, spawn_y, spawn_z, void=args.void)
 
     # --- Summary ---
     region_files = glob.glob(os.path.join(out_path, "region", "*.mca"))

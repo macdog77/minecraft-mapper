@@ -49,8 +49,11 @@ Output is saved to `./worlds/<name>/`. Copy that folder into your Minecraft save
 | `--scale N` | `1` | Horizontal blocks per OS cell. Each OS cell is 50 m, so `--scale 1` = 1 block per 50 m, `--scale 2` = 1 block per 25 m, `--scale 4` = 1 block per 12.5 m. |
 | `--vscale F` | `0.10` | Vertical multiplier applied to elevation in metres. `Y = 64 + round(elevation × F)`. |
 | `--biomes MODE` | `elevation` | `elevation` assigns biomes by height (ocean → plains → windswept hills → frozen peaks). `default` sets everything to plains. |
+| `--spawn LAT,LON` | map centre | Spawn at a WGS84 coordinate, e.g. `"56.974586,-3.396210"`. If the point is outside the generated map, a warning is printed and the spawn falls back to the map centre. |
 | `--no-water` | off | Skip inland water detection and the perimeter rim. |
 | `--no-rivers` | off | Skip OS Open Rivers rasterization. Auto-disabled at `--scale < 4`. |
+| `--buildings` | off | Detect the light-peach building-fill colour (#f8d8b8) on the OS raster tiles and place a 3-block stack of bricks on each flagged cell. Auto-disabled at `--scale < 8` (one OS cell is smaller than one block). |
+| `--void` | off | Use inline flat-void generators for `WorldGenSettings` so the area outside the pre-filled OS map stays as void. Triggers Minecraft's "Worlds using Experimental Settings are not supported" warning on load. Default (off) writes vanilla preset-based generators, which means chunks beyond the OS area fill with vanilla terrain but no warning appears. |
 | `--tiles-dir PATH` | `<input>/../../tiles` | Root of the OS raster TIFF folder. Only needed if the tile directory isn't a sibling of the data folder. |
 | `--rivers-path PATH` | `<input>/../../rivers/Data/oprvrs_gb.mbtiles` | Path to the OS Open Rivers MBTiles file. Only needed if it isn't in the default location. |
 | `--out PATH` | `./worlds/<name>` | Output world folder path. |
@@ -74,6 +77,18 @@ Rivers are only generated at `--scale 4` or higher — at smaller scales a singl
 
 If `mapbox-vector-tile` is missing, or the MBTiles file isn't found, rivers are skipped silently and a note is printed; everything else still works.
 
+**Buildings** (`--buildings`, `--scale 8`+)
+
+OS Explorer raster tiles paint the built-up-area background with a pale-peach fill (#f8d8b8). `--buildings` walks the same quadrant TIFFs as the water detector and matches palette entries within ±8 per channel of that colour.
+
+To keep buildings close to street level rather than whole 50 m OS cells, the detector aggregates pixels into a **5 m sub-cell mask** (10× denser than the elevation grid) and flags each sub-cell when ≥30% of its 5 × 5 pixels are peach. During chunk generation each block looks up its own sub-cell (nearest-neighbour, no blur), so isolated buildings stay crisp instead of merging into super-blocks. Flagged blocks get a 3-block-tall stack of `minecraft:bricks` on top of the surface. Tunables (`BUILDING_SUBCELL_M`, `TIFF_BUILDING_THRESHOLD`, `BUILDING_HEIGHT_BLOCKS`) live at the top of `generate.py`; use `building_mask_preview.py` (below) to preview what will be flagged without generating a world.
+
+Buildings lose to water — blocks flagged as both (e.g. harbours, river banks) stay water. At `--scale < 8` a 50 m cell resolves to less than one block, so the feature auto-disables with a note.
+
+**Spawn point** (`--spawn`)
+
+By default the spawn is placed at the geographical centre of the generated map, one block above the local surface. Passing `--spawn "lat,lon"` converts the WGS84 coordinate to BNG (via `locate.wgs84_to_bng`), maps it to a grid cell, and spawns there instead. If the coordinate lies outside the generated tiles, a warning is printed and the spawn falls back to the map centre.
+
 **Scale reference**
 
 | `--vscale` | Ben Nevis (1345 m) → Y | Best used for |
@@ -88,7 +103,7 @@ If `mapbox-vector-tile` is missing, or the MBTiles file isn't found, rivers are 
 | `2` | 400 × 400 blocks | 4,000 × 4,000 blocks |
 | `4` | 800 × 800 blocks | 8,000 × 8,000 blocks |
 
-**World settings:** creative mode, spawn at the geographical centre of the area 1 block above the surface, void flat generator beyond the OS data boundary.
+**World settings:** creative mode, spawn at the geographical centre of the map (or wherever `--spawn` points), one block above the surface. By default the world uses vanilla preset-based generators so chunks outside the OS area fill with normal Minecraft terrain; pass `--void` to keep those chunks as void at the cost of triggering the "Experimental Settings" warning on load.
 
 ---
 
@@ -190,6 +205,66 @@ python stitch.py "OS Map Data/data/nn" 1345 --tiff --grid
 The `--tiff` flag composites the OS raster map tiles over the heightmap at 33% opacity, so towns, roads, and water labels show through the relief shading. The `--grid` flag overlays a red grid with the tile code (e.g. NN30) labelled in each cell — useful for identifying which tile to pass to `generate.py` or `locate.py`. Layers are applied in order: heightmap → TIFF → grid.
 
 Output is saved in the current directory as `<REGION>_heightmap.png`, with `_tiff`, `_grid`, or `_tiff_grid` appended when overlays are enabled.
+
+---
+
+### `uk_map.py` — Composite the full UK raster map
+
+Stitches every OS raster TIFF under `OS Map Data/tiles/` into a single UK-wide PNG, scaled to a target height, with the 100 km BNG grid and region letters overlaid in red. Useful as an overview image to plan which regions to generate.
+
+```bash
+python uk_map.py
+python uk_map.py --height 4000 --out UK_map_highres.png
+python uk_map.py --no-grid               # plain map without overlay
+python uk_map.py --label-scale 0.3       # smaller region letters
+```
+
+**Options**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--height N` | `2000` | Output height in pixels. |
+| `--out PATH` | `./UK_map.png` | Output PNG path. |
+| `--no-grid` | off | Skip the red grid and region labels. |
+| `--label-scale F` | `0.5` | Region-letter size as fraction of a 100 km square. |
+
+---
+
+## Utilities
+
+Diagnostic and tuning helpers used when extending the feature-detection logic in `generate.py`.
+
+### `sample_palette.py` — Inspect an OS raster palette
+
+Dumps the palette of a single TIFF quadrant with an ANSI colour swatch per entry and the pixel count / percentage for each used index. Handy for identifying the palette index of a feature before writing a colour filter.
+
+```bash
+python sample_palette.py "OS Map Data/tiles/NT/NT27NW.tif" --only-used
+python sample_palette.py "OS Map Data/tiles/NT/NT27NW.tif" --filter "r>240,g>200,b>170"
+```
+
+### `building_mask_preview.py` — Preview the building mask for one TIFF
+
+Runs `generate._is_building_color` (or a manual `--r/--g/--b` override) against a single TIFF and writes a PNG where building pixels are black on white. Lets you tune the building filter without running the full world generator.
+
+```bash
+python building_mask_preview.py "OS Map Data/tiles/NT/NT27SW.tif"
+python building_mask_preview.py "OS Map Data/tiles/NT/NT27SW.tif" --cells
+python building_mask_preview.py "OS Map Data/tiles/NT/NT27SW.tif" --overlay
+python building_mask_preview.py "OS Map Data/tiles/NT/NT27SW.tif" --r 248,15 --g 216,15 --b 184,20
+```
+
+- `--cells` aggregates to 50 m OS cells and thresholds at `TIFF_BUILDING_THRESHOLD`, mirroring what `generate.py --buildings` actually places.
+- `--overlay` additionally writes `<stem>_overlay.png` with matched pixels tinted red on the source image.
+
+### `inspect_leveldat.py` — Dump experimental-flag fields from `level.dat`
+
+Prints the top-level `Data` keys of a generated world's `level.dat` and the full contents of the fields Minecraft checks when deciding whether a world uses experimental settings (`DataPacks`, `enabled_features`, `experiments`, `WorldGenSettings`, `Version`). Used when chasing "Worlds using Experimental Settings are not supported" warnings.
+
+```bash
+python inspect_leveldat.py worlds/<name>
+python inspect_leveldat.py worlds/<name>/level.dat
+```
 
 ---
 

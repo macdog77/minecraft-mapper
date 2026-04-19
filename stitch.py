@@ -31,7 +31,7 @@ from mesh import _find_tiffs, QUADRANTS, TILE_PX as TIFF_TILE_PX, SEA_COLOUR
 
 TILE_PX = 200          # cells per tile side (1 px per 50 m cell)
 BEN_NEVIS_M = 1345.0
-TIFF_OPACITY = 0.50
+TIFF_OPACITY = 0.75
 
 GRID_LINE_COLOUR = (220, 30, 30)      # red
 GRID_LINE_WIDTH  = 2

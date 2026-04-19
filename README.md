@@ -9,7 +9,7 @@ Converts Ordnance Survey Terrain 50 elevation data into playable Minecraft Java 
 Requires Python 3.10+. Install all dependencies in one command:
 
 ```bash
-pip install amulet-core tqdm numpy pillow pyproj
+pip install amulet-core tqdm numpy pillow pyproj mapbox-vector-tile
 ```
 
 | Package | Version tested | Used by |
@@ -18,7 +18,8 @@ pip install amulet-core tqdm numpy pillow pyproj
 | `numpy` | 1.26+ | `generate.py`, `mesh.py`, `stitch.py` — grid maths |
 | `tqdm` | 4.67+ | `generate.py`, `mesh.py` — progress bars |
 | `pillow` | 12+ | `generate.py`, `heightmap.py`, `mesh.py`, `stitch.py` — image I/O |
-| `pyproj` | 3.6+ | `locate.py` — WGS84 → British National Grid conversion |
+| `pyproj` | 3.6+ | `generate.py`, `locate.py` — WGS84 ↔ British National Grid conversion |
+| `mapbox-vector-tile` | 2.1+ | `generate.py` — decodes OS Open Rivers MVT tiles. Optional; rivers are silently skipped if absent. |
 
 ---
 
@@ -49,7 +50,9 @@ Output is saved to `./worlds/<name>/`. Copy that folder into your Minecraft save
 | `--vscale F` | `0.10` | Vertical multiplier applied to elevation in metres. `Y = 64 + round(elevation × F)`. |
 | `--biomes MODE` | `elevation` | `elevation` assigns biomes by height (ocean → plains → windswept hills → frozen peaks). `default` sets everything to plains. |
 | `--no-water` | off | Skip inland water detection and the perimeter rim. |
+| `--no-rivers` | off | Skip OS Open Rivers rasterization. Auto-disabled at `--scale < 4`. |
 | `--tiles-dir PATH` | `<input>/../../tiles` | Root of the OS raster TIFF folder. Only needed if the tile directory isn't a sibling of the data folder. |
+| `--rivers-path PATH` | `<input>/../../rivers/Data/oprvrs_gb.mbtiles` | Path to the OS Open Rivers MBTiles file. Only needed if it isn't in the default location. |
 | `--out PATH` | `./worlds/<name>` | Output world folder path. |
 
 **Water and rim**
@@ -62,6 +65,14 @@ Inland water (lochs, reservoirs, rivers) is detected from two signals, OR-combin
 For each flagged cell with elevation > 0 m, the top block is replaced with a water source block (`level=0`, so it stays put). Sea (elevation ≤ 0 m) is handled by the existing ocean fill up to Y = 63.
 
 A **perimeter rim** of stone is added wherever water touches the world edge, capped at one block above the local water level. Dry edges are left as natural terrain.
+
+**Rivers**
+
+If `mapbox-vector-tile` is installed and the OS Open Rivers MBTiles file is present (default `OS Map Data/rivers/Data/oprvrs_gb.mbtiles`), `generate.py` rasterises river, canal, and tidal-river centrelines from the z14 vector tiles into the same water mask as the lochs and reservoirs. Coordinates are reprojected Web Mercator → WGS84 → BNG and lines are drawn one cell wide using Bresenham.
+
+Rivers are only generated at `--scale 4` or higher — at smaller scales a single-cell line is ≥50 m wide, which makes every stream look like a small lake. After the water mask is blurred for rounded edges, river cells are pinned to full density so a 1-cell-wide line still survives the threshold while small lochs keep softened corners.
+
+If `mapbox-vector-tile` is missing, or the MBTiles file isn't found, rivers are skipped silently and a note is printed; everything else still works.
 
 **Scale reference**
 
@@ -150,13 +161,16 @@ Reads one tile (`.zip` or `.asc`) and saves a greyscale PNG. Black = sea level (
 
 ```bash
 python heightmap.py <tile.zip>
-python heightmap.py <tile.zip> [max_elev_m]
+python heightmap.py <tile.zip> [max_elev_m] [--tiff]
 
 python heightmap.py "OS Map Data/data/ng/ng42_OST50GRID_20250529.zip"
 python heightmap.py "OS Map Data/data/ng/ng42_OST50GRID_20250529.zip" 1000
+python heightmap.py "OS Map Data/data/ng/ng42_OST50GRID_20250529.zip" --tiff
 ```
 
-Output is saved alongside the input file as `<tilename>_heightmap.png`.
+The `--tiff` flag composites the OS raster map quadrants for this tile over the heightmap at 50% opacity, so coastlines, roads, and labels show through the relief shading.
+
+Output is saved alongside the input file as `<tilename>_heightmap.png` (or `<tilename>_heightmap_tiff.png` with `--tiff`).
 
 ---
 
@@ -166,15 +180,16 @@ Reads all tiles in a region folder and combines them into a single map image. No
 
 ```bash
 python stitch.py <region_dir>
-python stitch.py <region_dir> [max_elev_m] [--grid]
+python stitch.py <region_dir> [max_elev_m] [--tiff] [--grid]
 
 python stitch.py "OS Map Data/data/nn"
-python stitch.py "OS Map Data/data/nn" 1345 --grid
+python stitch.py "OS Map Data/data/nn" 1345 --tiff
+python stitch.py "OS Map Data/data/nn" 1345 --tiff --grid
 ```
 
-The `--grid` flag overlays a red grid with the tile code (e.g. NN30) labelled in each cell — useful for identifying which tile to pass to `generate.py` or `locate.py`.
+The `--tiff` flag composites the OS raster map tiles over the heightmap at 33% opacity, so towns, roads, and water labels show through the relief shading. The `--grid` flag overlays a red grid with the tile code (e.g. NN30) labelled in each cell — useful for identifying which tile to pass to `generate.py` or `locate.py`. Layers are applied in order: heightmap → TIFF → grid.
 
-Output is saved in the current directory as `<REGION>_heightmap.png` or `<REGION>_heightmap_grid.png`.
+Output is saved in the current directory as `<REGION>_heightmap.png`, with `_tiff`, `_grid`, or `_tiff_grid` appended when overlays are enabled.
 
 ---
 

@@ -58,6 +58,7 @@ TIFF_PX_PER_M        = 1       # OS tiles are 1 m/pixel, so 50 px per 50 m cell
 TIFF_WATER_THRESHOLD = 0.5     # fraction of blue pixels per cell to mark as water
 FLAT_WINDOW          = 5       # cells; 5 x 50 m = 250 m flat-area detector
 FLAT_RANGE_M         = 0.05    # cells in window must vary less than this to be "flat"
+WATER_MASK_THRESHOLD = 0.55    # threshold for bilinear-sampled water density (scale > 1)
 
 # Block palette — elevation thresholds (metres) for surface/sub-surface selection
 THRESHOLDS = [
@@ -304,6 +305,162 @@ def load_water_mask(zip_entries, grid, min_east, max_north, tiles_dir,
 
 
 # ---------------------------------------------------------------------------
+# Rivers (OS Open Rivers MBTiles vector data)
+# ---------------------------------------------------------------------------
+
+def _draw_line_cells(mask, c0, r0, c1, r1):
+    """Rasterize a single-cell-wide line into a boolean mask (Bresenham)."""
+    rows, cols = mask.shape
+    dc = abs(c1 - c0)
+    dr = -abs(r1 - r0)
+    sc = 1 if c0 < c1 else -1
+    sr = 1 if r0 < r1 else -1
+    err = dc + dr
+    while True:
+        if 0 <= r0 < rows and 0 <= c0 < cols:
+            mask[r0, c0] = True
+        if c0 == c1 and r0 == r1:
+            return
+        e2 = 2 * err
+        if e2 >= dr:
+            err += dr
+            c0 += sc
+        if e2 <= dc:
+            err += dc
+            r0 += sr
+
+
+def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
+                    forms=("canal", "inlandRiver", "tidalRiver")):
+    """
+    Rasterize OS Open Rivers centrelines into a boolean mask aligned with the
+    elevation grid. Returns None if the mapbox-vector-tile package is missing.
+
+    mbtiles_path is a SQLite MBTiles file of zoom 9-14 MVT tiles. We only read
+    zoom 14 for full resolution. Lines are transformed from Web Mercator pixel
+    coords → WGS84 → BNG (EPSG:27700) → cell indices.
+    """
+    try:
+        import mapbox_vector_tile
+    except ImportError:
+        print("  Skipping rivers: 'mapbox-vector-tile' not installed  "
+              "(pip install mapbox-vector-tile).")
+        return None
+
+    import gzip as _gzip
+    import math as _math
+    import sqlite3
+    from pyproj import Transformer
+
+    grid_rows, grid_cols = grid_shape
+    max_east  = min_east + grid_cols * CELL_SIZE_M
+    min_north = max_north - grid_rows * CELL_SIZE_M
+
+    to_wgs84 = Transformer.from_crs("EPSG:27700", "EPSG:4326", always_xy=True)
+    to_bng   = Transformer.from_crs("EPSG:4326",  "EPSG:27700", always_xy=True)
+
+    zoom = 14
+    n_tiles = 2 ** zoom
+
+    def lonlat_to_tile(lon, lat):
+        tx = int((lon + 180) / 360 * n_tiles)
+        lat_rad = _math.radians(lat)
+        ty = int((1 - _math.log(_math.tan(lat_rad) + 1 / _math.cos(lat_rad)) / _math.pi) / 2 * n_tiles)
+        return tx, ty
+
+    # Sample a 5x5 grid across the BNG bounds — edges aren't straight in WGS84,
+    # so corner-only sampling can miss tiles along curved borders.
+    samples = []
+    for f_e in np.linspace(min_east, max_east, 5):
+        for f_n in np.linspace(min_north, max_north, 5):
+            lon, lat = to_wgs84.transform(f_e, f_n)
+            samples.append(lonlat_to_tile(lon, lat))
+    txs, tys = zip(*samples)
+    tx_min, tx_max = min(txs), max(txs)
+    ty_min, ty_max = min(tys), max(tys)
+
+    # MBTiles stores tile_row in TMS convention (flipped from XYZ).
+    tms_y_min = n_tiles - 1 - ty_max
+    tms_y_max = n_tiles - 1 - ty_min
+
+    conn = sqlite3.connect(mbtiles_path)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT tile_column, tile_row, tile_data FROM tiles "
+        "WHERE zoom_level=? AND tile_column BETWEEN ? AND ? "
+        "AND tile_row BETWEEN ? AND ?",
+        (zoom, tx_min, tx_max, tms_y_min, tms_y_max),
+    )
+    tile_rows = cur.fetchall()
+    conn.close()
+
+    print(f"Loading rivers from {os.path.basename(mbtiles_path)} "
+          f"({len(tile_rows)} MVT tiles at z{zoom})...")
+
+    mask = np.zeros(grid_shape, dtype=bool)
+    n_segments = 0
+
+    for tile_col, tile_row, raw in tqdm(tile_rows, unit="tile", leave=False):
+        tx = tile_col
+        ty = n_tiles - 1 - tile_row
+        try:
+            pbf = _gzip.decompress(raw)
+        except OSError:
+            pbf = raw
+        try:
+            decoded = mapbox_vector_tile.decode(pbf, y_coord_down=True)
+        except Exception as ex:
+            tqdm.write(f"  Warning: tile {tx},{tile_row} decode failed: {ex}")
+            continue
+        layer = decoded.get("watercourse_link")
+        if not layer:
+            continue
+        extent = layer.get("extent", 4096)
+
+        all_lines = []
+        for feat in layer["features"]:
+            form = feat.get("properties", {}).get("form")
+            if form not in forms:
+                continue
+            geom = feat["geometry"]
+            gtype = geom["type"]
+            if gtype == "LineString":
+                all_lines.append(geom["coordinates"])
+            elif gtype == "MultiLineString":
+                all_lines.extend(geom["coordinates"])
+        if not all_lines:
+            continue
+
+        # Flatten all vertices so pyproj can batch-transform in one call.
+        flat_lon, flat_lat, segments = [], [], []
+        for line in all_lines:
+            start = len(flat_lon)
+            for px, py in line:
+                lon = (tx + px / extent) / n_tiles * 360.0 - 180.0
+                y_frac = (ty + py / extent) / n_tiles
+                lat = _math.degrees(_math.atan(_math.sinh(_math.pi * (1 - 2 * y_frac))))
+                flat_lon.append(lon)
+                flat_lat.append(lat)
+            segments.append((start, len(flat_lon)))
+
+        es, ns = to_bng.transform(flat_lon, flat_lat)
+        cs = np.floor((np.asarray(es) - min_east)  / CELL_SIZE_M).astype(np.int32)
+        rs = np.floor((max_north - np.asarray(ns)) / CELL_SIZE_M).astype(np.int32)
+
+        for start, end in segments:
+            if end - start < 2:
+                continue
+            for i in range(start, end - 1):
+                _draw_line_cells(mask, int(cs[i]), int(rs[i]),
+                                 int(cs[i + 1]), int(rs[i + 1]))
+            n_segments += 1
+
+    n_cells = int(mask.sum())
+    print(f"  River cells: {n_cells:,} from {n_segments} segments")
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # Block helpers
 # ---------------------------------------------------------------------------
 
@@ -363,7 +520,8 @@ ARRAY_OFFSET = -Y_MIN   # = 64; array index = Y + ARRAY_OFFSET
 ARRAY_HEIGHT = Y_MAX - Y_MIN + 1  # = 384
 
 def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
-                   water_mask=None, mc_width=None, mc_depth=None):
+                   water_mask=None, water_density=None,
+                   mc_width=None, mc_depth=None):
     """
     Build and return an amulet Chunk for chunk coordinates (cx, cz).
     block_uni: dict name -> universal Block object.
@@ -418,14 +576,47 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
             gx = cx * 16 + lx   # global block X
             gz = cz * 16 + lz   # global block Z
 
-            # Map block coords → cell coords
+            # Map block coords → cell coords (integer, for bounds check)
             cell_col = gx // scale
             cell_row = gz // scale
 
-            if 0 <= cell_row < grid_rows and 0 <= cell_col < grid_cols:
-                elev = float(grid[cell_row, cell_col])
-            else:
+            in_bounds = 0 <= cell_row < grid_rows and 0 <= cell_col < grid_cols
+
+            if not in_bounds:
                 elev = 0.0
+                is_mask_water_cell = False
+            elif scale > 1:
+                # Bilinear sampling for both elevation and the water mask so
+                # neither shows a 2x2/4x4 grid pattern at the cell boundaries.
+                # Block centres are at (gx+0.5, gz+0.5) block-space; cell centres
+                # sit at (c+0.5)*scale, so the float grid coordinate is:
+                fx = (gx + 0.5) / scale - 0.5
+                fz = (gz + 0.5) / scale - 0.5
+                c0 = int(np.floor(fx)); r0 = int(np.floor(fz))
+                tx = fx - c0;           tz = fz - r0
+                c0c = max(0, min(grid_cols - 1, c0))
+                c1c = max(0, min(grid_cols - 1, c0 + 1))
+                r0c = max(0, min(grid_rows - 1, r0))
+                r1c = max(0, min(grid_rows - 1, r0 + 1))
+                w00 = (1 - tx) * (1 - tz)
+                w01 = tx       * (1 - tz)
+                w10 = (1 - tx) * tz
+                w11 = tx       * tz
+                elev = float(
+                    w00 * grid[r0c, c0c] + w01 * grid[r0c, c1c]
+                    + w10 * grid[r1c, c0c] + w11 * grid[r1c, c1c]
+                )
+                if water_density is not None:
+                    wm = (w00 * water_density[r0c, c0c] + w01 * water_density[r0c, c1c]
+                          + w10 * water_density[r1c, c0c] + w11 * water_density[r1c, c1c])
+                    is_mask_water_cell = wm >= WATER_MASK_THRESHOLD
+                else:
+                    is_mask_water_cell = False
+            else:
+                elev = float(grid[cell_row, cell_col])
+                is_mask_water_cell = (
+                    water_mask is not None and bool(water_mask[cell_row, cell_col])
+                )
 
             biome_elevs[lx, lz] = elev
 
@@ -470,9 +661,7 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
             # --- Inland water overlay: replace top block with water ---
             # Applies to cells flagged by TIFF-blue or flat-area detection.
             # Sea (elev <= 0) is already handled above, so we only touch elev > 0.
-            if (water_mask is not None
-                    and 0 <= cell_row < grid_rows and 0 <= cell_col < grid_cols
-                    and water_mask[cell_row, cell_col]
+            if (is_mask_water_cell
                     and elev > 0
                     and 0 <= arr_surf < ARRAY_HEIGHT):
                 col_blocks[lx, arr_surf, lz] = WATER_ID
@@ -481,12 +670,7 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
             if (mc_width is not None and mc_depth is not None
                     and (gx == 0 or gx == mc_width - 1
                          or gz == 0 or gz == mc_depth - 1)):
-                is_mask_water = (
-                    water_mask is not None
-                    and 0 <= cell_row < grid_rows and 0 <= cell_col < grid_cols
-                    and water_mask[cell_row, cell_col]
-                    and elev > 0
-                )
+                is_mask_water = is_mask_water_cell and elev > 0
                 is_sea_water = elev <= 0 and arr_surf < SEA_SURFACE_Y + ARRAY_OFFSET
                 if is_mask_water:
                     water_top_arr = arr_surf
@@ -691,8 +875,13 @@ def main():
     parser.add_argument("--out",     default=None,                   help="Output world folder")
     parser.add_argument("--no-water", action="store_true",
                         help="Skip inland water detection and perimeter rim.")
+    parser.add_argument("--no-rivers", action="store_true",
+                        help="Skip OS Open Rivers rasterization (auto-off at scale < 4).")
     parser.add_argument("--tiles-dir", default=None,
                         help="Path to OS raster tiles root (default: '<input-parent>/../tiles').")
+    parser.add_argument("--rivers-path", default=None,
+                        help="Path to OS Open Rivers .mbtiles "
+                             "(default: '<input-parent>/../rivers/Data/oprvrs_gb.mbtiles').")
     args = parser.parse_args()
 
     # --- Discover tiles ---
@@ -728,6 +917,46 @@ def main():
         water_mask = load_water_mask(zip_entries, grid, origin_easting,
                                      origin_northing_top, tiles_dir)
 
+    # --- Load rivers (OS Open Rivers vector data) ---
+    # Only meaningful at scale >= 4: at scale 1 a single-cell line is 50 m wide,
+    # which makes every stream look like a small lake.
+    river_mask = None
+    if not args.no_rivers:
+        if args.scale < 4:
+            print(f"Skipping rivers (--scale {args.scale} < 4 — lines would be too fat).")
+        else:
+            if args.rivers_path:
+                rivers_path = args.rivers_path
+            else:
+                first_zip_dir = os.path.dirname(zip_entries[0][0])
+                rivers_path = os.path.normpath(os.path.join(
+                    first_zip_dir, "..", "..", "rivers", "Data", "oprvrs_gb.mbtiles"))
+            if os.path.isfile(rivers_path):
+                river_mask = load_river_mask(
+                    grid.shape, origin_easting, origin_northing_top, rivers_path)
+                if river_mask is not None:
+                    water_mask = river_mask if water_mask is None else (water_mask | river_mask)
+            else:
+                print(f"Rivers file not found at {rivers_path} — skipping.")
+
+    # Pre-blur the water mask with a 3x3 Gaussian-ish kernel so bilinear
+    # sampling rounds off corners of small ponds/lochs instead of producing
+    # diamond-shaped blobs. Interior of wide water bodies stays at density 1.0.
+    water_density = None
+    if water_mask is not None:
+        m = water_mask.astype(np.float32)
+        p = np.pad(m, 1, mode="edge")
+        water_density = (
+            1 * p[:-2, :-2] + 2 * p[:-2, 1:-1] + 1 * p[:-2, 2:]
+            + 2 * p[1:-1, :-2] + 4 * p[1:-1, 1:-1] + 2 * p[1:-1, 2:]
+            + 1 * p[2:, :-2] + 2 * p[2:, 1:-1] + 1 * p[2:, 2:]
+        ) / 16.0
+        # A 1-cell-wide river line blurs to density 0.5 along its length — below
+        # the 0.55 threshold, so the line vanishes. Pin river cells to 1.0 so
+        # rivers always survive the threshold, while lochs keep rounded edges.
+        if river_mask is not None:
+            water_density[river_mask] = 1.0
+
     # --- Create world ---
     print(f"\nCreating world: {world_name}")
     fmt = AnvilFormat(out_path)
@@ -760,6 +989,7 @@ def main():
                     block_uni=block_uni,
                     biome_mode=args.biomes,
                     water_mask=water_mask,
+                    water_density=water_density,
                     mc_width=mc_width,
                     mc_depth=mc_depth,
                 )

@@ -193,6 +193,18 @@ Output is saved in the current directory as `<REGION>_heightmap.png`, with `_tif
 
 ---
 
+## Appendix — Data Sources
+
+All three datasets are free Ordnance Survey OpenData products. Download from the OS Data Hub and unpack into `OS Map Data/` as described in `OSData.md`.
+
+| Dataset | Used for | Format | Download |
+|---------|----------|--------|----------|
+| OS Terrain 50 | Elevation grid (50 m / cell) for the whole of Great Britain | Zipped ESRI ASCII Grid (`.asc`) | [osdatahub.os.uk/data/downloads/open/Terrain50](https://osdatahub.os.uk/data/downloads/open/Terrain50) |
+| OS OpenMap Local | Water-surface detection via blue-pixel ratio on the raster map | GeoTIFF, full colour | [osdatahub.os.uk/data/downloads/open/OpenMapLocal](https://osdatahub.os.uk/data/downloads/open/OpenMapLocal) |
+| OS Open Rivers | River, canal, and tidal-river centrelines (work in progress) | Vector Tiles (`.mbtiles`) | [osdatahub.os.uk/data/downloads/open/OpenRivers](https://osdatahub.os.uk/data/downloads/open/OpenRivers) |
+
+---
+
 ## Appendix — OS Region Codes
 
 Each region is a 100 km × 100 km British National Grid square. Tile count indicates how many 10 km tiles are present (max 100; lower counts mean significant sea coverage).

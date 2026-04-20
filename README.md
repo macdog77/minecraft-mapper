@@ -91,11 +91,13 @@ By default the spawn is placed at the geographical centre of the generated map, 
 
 **Scale reference**
 
+Minecraft's build limit is Y = 319 and sea level is pinned to Y = 64, leaving 255 blocks of vertical headroom. Anything above Y = 319 is clipped. Run `max_vscale.py` (below) against your input to get the exact largest safe `--vscale`.
+
 | `--vscale` | Ben Nevis (1345 m) → Y | Best used for |
 |------------|------------------------|---------------|
 | `0.10` | 199 | Large regions, whole-UK maps |
 | `0.15` | 266 | Single regions |
-| `0.20` | 333 | Single tiles or small areas |
+| `0.189` | 318 | Single tiles or small areas (near max for a Ben Nevis tile) |
 
 | `--scale` | 1 tile (10 km) | Full region (100 km) |
 |-----------|----------------|----------------------|
@@ -167,6 +169,31 @@ You can chain it with `generate.py` to go straight from a coordinate to a world:
 python locate.py 55.944546 -3.184685
 python generate.py "OS Map Data/data/nt/nt27_OST50GRID_20250529.zip" --scale 4 --vscale 0.2
 ```
+
+---
+
+### `max_vscale.py` — Find the largest safe `--vscale` for your input
+
+Scans the elevation grid of a tile, region, or whole-UK dataset and reports the highest point plus the largest `--vscale` that keeps every peak at or below Minecraft's Y = 319 build limit. The recommended value is truncated to 4 decimal places so the peak lands as close to Y = 319 as possible without clipping.
+
+```bash
+python max_vscale.py <tile.zip|region_dir|data_root>
+
+python max_vscale.py "OS Map Data/data/nn/nn16_OST50GRID_20250529.zip"   # Ben Nevis tile
+python max_vscale.py "OS Map Data/data/nn"                               # NN region
+python max_vscale.py "OS Map Data/data"                                  # whole UK
+```
+
+Output:
+```
+Highest point: 1344.8 m  (tile NN16, BNG 216675E 771325N)
+MC headroom:   255 blocks  (Y=64 sea level -> Y=319 build limit)
+
+Max safe --vscale: 0.189618
+Suggested (4 dp):  0.1896  -> peak lands at Y = 319
+```
+
+Feed the suggested value directly into `generate.py --vscale`.
 
 ---
 
@@ -256,6 +283,17 @@ python building_mask_preview.py "OS Map Data/tiles/NT/NT27SW.tif" --r 248,15 --g
 
 - `--cells` aggregates to 50 m OS cells and thresholds at `TIFF_BUILDING_THRESHOLD`, mirroring what `generate.py --buildings` actually places.
 - `--overlay` additionally writes `<stem>_overlay.png` with matched pixels tinted red on the source image.
+
+### `TestWorld.py` — Build-height diagnostic world
+
+Writes a minimal world containing a single stone tower that runs from bedrock (Y = −64) to the build limit (Y = 319), with `gold_block` markers at every 32-block interval (plus Y = 63, 64, 255, 256, 319). Loading it in Minecraft and flying up the tower confirms the save pipeline is producing every vertical section correctly — if the tower ends early, the topmost visible gold marker pinpoints where sections are being dropped.
+
+```bash
+python TestWorld.py
+python TestWorld.py --out worlds/TowerCheck
+```
+
+Output is saved to `./worlds/TestWorld_Tower/` by default. Used when investigating amulet section-write regressions or Minecraft dimension-bounds issues.
 
 ### `inspect_leveldat.py` — Dump experimental-flag fields from `level.dat`
 

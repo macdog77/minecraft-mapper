@@ -66,6 +66,16 @@ TIFF_WATER_THRESHOLD = 0.5     # fraction of blue pixels per cell to mark as wat
 FLAT_WINDOW          = 5       # cells; 5 x 50 m = 250 m flat-area detector
 FLAT_RANGE_M         = 0.05    # cells in window must vary less than this to be "flat"
 WATER_MASK_THRESHOLD = 0.50    # threshold for bilinear-sampled water density (scale > 1)
+WATER_CELL_FLOOR     = 0.85    # minimum post-blur density for any True water cell, so
+                               # isolated small ponds survive bilinear sampling at
+                               # scale > 1. A 1-cell pond blurs to 0.25 and a 2-cell
+                               # to 0.375 — both far below WATER_MASK_THRESHOLD, so
+                               # they vanish entirely at scale 4/8 without this floor.
+                               # 0.85 is the minimum that renders the full "plus"
+                               # pattern (12 of 16 blocks) for a 1-cell pond at
+                               # scale 4 — corners are geometrically unreachable.
+                               # Bloat on large lochs is <2% (edge True cells with
+                               # natural density ≥ 0.85 are unchanged).
 
 # Building detection tuning (requires --buildings; auto-off below MIN_BUILDING_SCALE)
 TIFF_BUILDING_THRESHOLD = 0.30  # fraction of peach pixels per sub-cell to mark as building
@@ -120,7 +130,13 @@ def discover_zips(input_path):
     Return a list of (zip_path, e_digit, n_digit, region_code) tuples.
     Accepts a single zip, a region folder, or a parent folder of region folders.
     """
+    # Strip a trailing quote: on Windows bash, `"OS Map Data\data\nn\"` escapes
+    # the closing quote and leaves a literal `"` on the end of the argument.
+    input_path = input_path.rstrip('"').rstrip("'")
     input_path = os.path.abspath(input_path)
+
+    if not os.path.exists(input_path):
+        raise ValueError(f"Input path does not exist: {input_path}")
 
     if input_path.lower().endswith(".zip"):
         name = os.path.basename(input_path).lower()
@@ -1186,9 +1202,13 @@ def main():
             + 2 * p[1:-1, :-2] + 4 * p[1:-1, 1:-1] + 2 * p[1:-1, 2:]
             + 1 * p[2:, :-2] + 2 * p[2:, 1:-1] + 1 * p[2:, 2:]
         ) / 16.0
-        # A 1-cell-wide river line blurs to density 0.5 along its length — below
-        # the 0.55 threshold, so the line vanishes. Pin river cells to 1.0 so
-        # rivers always survive the threshold, while lochs keep rounded edges.
+        # Floor every True water cell's density at WATER_CELL_FLOOR so isolated
+        # 1-2 cell ponds (e.g. Blackford Pond) don't blur below the 0.5 threshold
+        # and vanish at --scale 4/8. Large water bodies keep their natural blur
+        # (interior True cells already ≥ 0.75), so loch edges stay rounded.
+        water_density = np.maximum(water_density, m * WATER_CELL_FLOOR)
+        # Rivers are 1-cell-wide lines: pin to 1.0 so they stay continuous through
+        # bilinear sampling instead of breaking up into dots between cells.
         if river_mask is not None:
             water_density[river_mask] = 1.0
 
@@ -1204,11 +1224,46 @@ def main():
             building_mask = load_building_mask(zip_entries, grid, origin_easting,
                                                origin_northing_top, tiles_dir)
 
+    # --- Resolve spawn (needed before patch_level_dat) ---
+    # Default spawn: centre of the map. --spawn overrides with a WGS84 coord.
+    spawn_col = grid_cols // 2
+    spawn_row = grid_rows // 2
+    if args.spawn:
+        try:
+            lat_s, lon_s = args.spawn.split(",")
+            lat, lon = float(lat_s), float(lon_s)
+        except ValueError:
+            print(f"--spawn: could not parse '{args.spawn}' — expected 'lat,lon'. "
+                  "Using map centre.")
+        else:
+            east, north = wgs84_to_bng(lat, lon)
+            col = int((east - origin_easting) / CELL_SIZE_M)
+            row = int((origin_northing_top - north) / CELL_SIZE_M)
+            if 0 <= col < grid_cols and 0 <= row < grid_rows:
+                spawn_col, spawn_row = col, row
+                print(f"Spawn set from {lat}, {lon} -> grid cell ({col}, {row}).")
+            else:
+                print(f"Spawn coord {lat}, {lon} (BNG {east:.0f}E {north:.0f}N) "
+                      f"is outside the generated map — using map centre.")
+    spawn_elev = float(grid[spawn_row, spawn_col])
+    spawn_x = (spawn_col * args.scale) + (args.scale // 2)
+    spawn_z = (spawn_row * args.scale) + (args.scale // 2)
+    spawn_y = MAP_ZERO_Y + round(spawn_elev * args.vscale) + 1
+
     # --- Create world ---
     print(f"\nCreating world: {world_name}")
     fmt = AnvilFormat(out_path)
     fmt.create_and_open(MC_VERSION_ID, MC_VERSION, overwrite=True)
     fmt.close()
+
+    # Patch level.dat BEFORE load_level. Amulet's AnvilFormat reads bounds from
+    # level.dat's WorldGenSettings when the level loads; if WorldGenSettings is
+    # missing (as it is in amulet's fresh create_and_open output), it falls
+    # back to DefaultSelection (Y=0..256) and every saved chunk gets truncated
+    # to 16 sections, silently dropping anything above Y=255 or below Y=0.
+    # Writing the overworld/nether/end dimension references now lets amulet
+    # detect the 1.18+ (-64..319) bounds before any chunks are encoded.
+    patch_level_dat(out_path, world_name, spawn_x, spawn_y, spawn_z, void=args.void)
 
     level = amulet.load_level(out_path)
 
@@ -1251,35 +1306,6 @@ def main():
 
     # --- Entity storage (required by Minecraft 1.17+) ---
     write_entity_files(out_path, cx_min, cx_max, cz_min, cz_max)
-
-    # --- Patch level.dat (fix WorldGenSettings + spawn) ---
-    # Default spawn: centre of the map. --spawn overrides with a WGS84 coord.
-    spawn_col = grid_cols // 2
-    spawn_row = grid_rows // 2
-
-    if args.spawn:
-        try:
-            lat_s, lon_s = args.spawn.split(",")
-            lat, lon = float(lat_s), float(lon_s)
-        except ValueError:
-            print(f"--spawn: could not parse '{args.spawn}' — expected 'lat,lon'. "
-                  "Using map centre.")
-        else:
-            east, north = wgs84_to_bng(lat, lon)
-            col = int((east - origin_easting) / CELL_SIZE_M)
-            row = int((origin_northing_top - north) / CELL_SIZE_M)
-            if 0 <= col < grid_cols and 0 <= row < grid_rows:
-                spawn_col, spawn_row = col, row
-                print(f"Spawn set from {lat}, {lon} → grid cell ({col}, {row}).")
-            else:
-                print(f"Spawn coord {lat}, {lon} (BNG {east:.0f}E {north:.0f}N) "
-                      f"is outside the generated map — using map centre.")
-
-    spawn_elev = float(grid[spawn_row, spawn_col])
-    spawn_x = (spawn_col * args.scale) + (args.scale // 2)
-    spawn_z = (spawn_row * args.scale) + (args.scale // 2)
-    spawn_y = MAP_ZERO_Y + round(spawn_elev * args.vscale) + 1
-    patch_level_dat(out_path, world_name, spawn_x, spawn_y, spawn_z, void=args.void)
 
     # --- Summary ---
     region_files = glob.glob(os.path.join(out_path, "region", "*.mca"))

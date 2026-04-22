@@ -56,6 +56,8 @@ Output is saved to `./worlds/<name>/`. Copy that folder into your Minecraft save
 | `--void` | off | Use inline flat-void generators for `WorldGenSettings` so the area outside the pre-filled OS map stays as void. Triggers Minecraft's "Worlds using Experimental Settings are not supported" warning on load. Default (off) writes vanilla preset-based generators, which means chunks beyond the OS area fill with vanilla terrain but no warning appears. |
 | `--tiles-dir PATH` | `<input>/../../tiles` | Root of the OS raster TIFF folder. Only needed if the tile directory isn't a sibling of the data folder. |
 | `--rivers-path PATH` | `<input>/../../rivers/Data/oprvrs_gb.mbtiles` | Path to the OS Open Rivers MBTiles file. Only needed if it isn't in the default location. |
+| `--halo N` | `ceil(16/scale)+3` | Cells loaded around each tile from its 8 neighbours for seamless bilinear sampling and flat-area / water detection. Defaults to 19 at `--scale 1`, 5 at `--scale 8`. Bigger values cost extra zip reads per tile. |
+| `--flush-every N` | `1` | Flush amulet's in-memory chunk cache every N tiles. Default 1 (flush after each tile) keeps memory bounded for whole-UK runs. Higher values save less often but hold more chunks in RAM. |
 | `--out PATH` | `./worlds/<name>` | Output world folder path. |
 
 **Water and rim**

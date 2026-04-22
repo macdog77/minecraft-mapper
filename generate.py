@@ -32,6 +32,7 @@ import re
 import shutil
 import sys
 import zipfile
+from functools import lru_cache
 from math import ceil
 
 import amulet
@@ -157,77 +158,164 @@ def discover_zips(input_path):
     return results
 
 
-def load_elevation_grid(zip_entries):
+def scan_headers(zip_entries):
     """
-    Stitch all tiles into a single 2D numpy float32 array.
-    Returns (grid, origin_easting, origin_northing_top).
+    Read just the header of every tile (fast — no elevation rows).
+    Returns a dict {(e_digit, n_digit, region): (header, zip_path)}.
 
-    grid[row, col] = elevation in metres.
-    Row 0 = northernmost, col 0 = westernmost.
-    origin_easting      = BNG easting of the left edge of col 0.
-    origin_northing_top = BNG northing of the top edge of row 0.
+    Tiles that fail to parse are skipped with a warning. Subsequent passes
+    iterate this dict rather than zip_entries to avoid re-scanning failures.
     """
-    # Determine bounding box from tile headers
-    # Each tile header gives us xllcorner, yllcorner (SW corner of tile)
     headers = {}
     print(f"Reading {len(zip_entries)} tile headers...")
     for zp, e_digit, n_digit, region in tqdm(zip_entries, unit="tile", leave=False):
         try:
             hdr, _ = _load_zip(zp)
-            headers[(e_digit, n_digit, region)] = hdr
+            headers[(e_digit, n_digit, region)] = (hdr, zp)
         except Exception as ex:
             print(f"  Warning: skipping {os.path.basename(zp)}: {ex}")
-
     if not headers:
         raise RuntimeError("No tiles could be read.")
+    return headers
 
-    # Grid extents in terms of (e_digit, n_digit) — may span multiple regions
-    # We use the actual BNG coordinates from headers for accuracy.
-    # Compute global origin
-    min_east  = min(h["xllcorner"] for h in headers.values())
-    min_north = min(h["yllcorner"] for h in headers.values())
-    max_north = max(h["yllcorner"] + h["nrows"] * CELL_SIZE_M for h in headers.values())
-    max_east  = max(h["xllcorner"] + h["ncols"] * CELL_SIZE_M for h in headers.values())
 
+def compute_global_extent(headers):
+    """
+    From the header dict, compute the bounding box and total grid size.
+    Returns (min_east, max_north, total_rows, total_cols).
+    """
+    min_east  = min(h["xllcorner"] for h, _ in headers.values())
+    min_north = min(h["yllcorner"] for h, _ in headers.values())
+    max_north = max(h["yllcorner"] + h["nrows"] * CELL_SIZE_M for h, _ in headers.values())
+    max_east  = max(h["xllcorner"] + h["ncols"] * CELL_SIZE_M for h, _ in headers.values())
     total_cols = round((max_east  - min_east)  / CELL_SIZE_M)
     total_rows = round((max_north - min_north) / CELL_SIZE_M)
+    return min_east, max_north, total_rows, total_cols
 
-    print(f"Grid: {total_cols} x {total_rows} cells  "
-          f"({total_cols*CELL_SIZE_M/1000:.0f} km x {total_rows*CELL_SIZE_M/1000:.0f} km)")
-    print(f"BNG origin: E{min_east:.0f}  N{min_north:.0f}..{max_north:.0f}")
 
-    grid = np.full((total_rows, total_cols), np.nan, dtype=np.float32)
+def _tile_global_offset(hdr, min_east, max_north):
+    """Return (row_offset, col_offset) of a tile's NW cell in the global grid."""
+    nrows = int(hdr["nrows"])
+    col = round((hdr["xllcorner"] - min_east) / CELL_SIZE_M)
+    row = round((max_north - (hdr["yllcorner"] + nrows * CELL_SIZE_M)) / CELL_SIZE_M)
+    return row, col
 
-    print("Loading elevation data...")
-    for zp, e_digit, n_digit, region in tqdm(zip_entries, unit="tile"):
-        key = (e_digit, n_digit, region)
-        if key not in headers:
-            continue
-        try:
-            hdr, rows = _load_zip(zp)
-        except Exception as ex:
-            print(f"  Warning: skipping {os.path.basename(zp)}: {ex}")
-            continue
 
-        xll = hdr["xllcorner"]
-        yll = hdr["yllcorner"]
-        ncols = int(hdr["ncols"])
+def build_tile_index(headers, min_east, max_north):
+    """
+    Return a dict {(row_offset, col_offset): key} mapping a tile's global NW
+    cell to its header key. Used for O(1) neighbour lookup when loading halos.
+    """
+    index = {}
+    for key, (hdr, _zp) in headers.items():
+        row, col = _tile_global_offset(hdr, min_east, max_north)
+        index[(row, col)] = key
+    return index
+
+
+@lru_cache(maxsize=16)
+def _load_tile_elev(zp):
+    """
+    Load a tile's elevation into a float32 2D array with nodata → 0.0.
+    LRU-cached so halo reads from a neighbour don't re-parse its zip when
+    the neighbour is later processed as a core tile.
+
+    Returns (nrows, ncols, arr). Header metadata is available via scan_headers.
+    """
+    hdr, rows = _load_zip(zp)
+    arr = np.array(rows, dtype=np.float32)
+    nodata = hdr.get("nodata_value", -9999)
+    arr[arr == nodata] = np.nan
+    arr = np.where(np.isnan(arr), 0.0, arr).astype(np.float32)
+    return int(hdr["nrows"]), int(hdr["ncols"]), arr
+
+
+def load_tile_with_halo(key, headers, tile_index, min_east, max_north, halo):
+    """
+    Load a tile's elevation grid padded with `halo` cells on every side from
+    neighbouring tiles. Off-coverage halo cells are left at 0.0.
+
+    Returns (tile_grid, core_row0, core_col0, nrows, ncols) where (core_row0,
+    core_col0) is the global NW cell of the core (non-halo) area. The local
+    index of the core's NW cell inside tile_grid is (halo, halo).
+    """
+    hdr, zp = headers[key]
+    nrows, ncols, core = _load_tile_elev(zp)
+    core_row0, core_col0 = _tile_global_offset(hdr, min_east, max_north)
+
+    H = halo
+    full = np.zeros((nrows + 2 * H, ncols + 2 * H), dtype=np.float32)
+    full[H:H + nrows, H:H + ncols] = core
+
+    # Walk candidate neighbours. Tile sizes vary (edge tiles of a region can
+    # be smaller), so probe the 8 compass positions using this tile's own size
+    # as the step — good enough because the OS dataset is uniform 200x200 and
+    # any off-by-one falls into missing-tile territory anyway.
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nkey = tile_index.get((core_row0 + dr * nrows, core_col0 + dc * ncols))
+            if nkey is None:
+                continue
+            n_hdr, n_zp = headers[nkey]
+            n_nrows, n_ncols, n_arr = _load_tile_elev(n_zp)
+            n_row0, n_col0 = _tile_global_offset(n_hdr, min_east, max_north)
+
+            # Global overlap between halo rectangle and neighbour tile.
+            g_r0 = max(core_row0 - H, n_row0)
+            g_r1 = min(core_row0 + nrows + H, n_row0 + n_nrows)
+            g_c0 = max(core_col0 - H, n_col0)
+            g_c1 = min(core_col0 + ncols + H, n_col0 + n_ncols)
+            if g_r1 <= g_r0 or g_c1 <= g_c0:
+                continue
+            full[g_r0 - (core_row0 - H):g_r1 - (core_row0 - H),
+                 g_c0 - (core_col0 - H):g_c1 - (core_col0 - H)] = \
+                n_arr[g_r0 - n_row0:g_r1 - n_row0, g_c0 - n_col0:g_c1 - n_col0]
+
+    return full, core_row0, core_col0, nrows, ncols
+
+
+def chunks_owned_by_tile(core_row0, core_col0, nrows, ncols, scale):
+    """
+    Yield (cx, cz) chunk coordinates whose SW block corner falls inside this
+    tile's core area. Ownership rule guarantees each chunk is emitted by
+    exactly one tile with no gaps: the SW-corner block (cx*16, cz*16) sits in
+    [core_col0*scale, (core_col0+ncols)*scale) on the X axis and the
+    corresponding range on Z.
+    """
+    x_lo = core_col0 * scale
+    x_hi = (core_col0 + ncols) * scale
+    z_lo = core_row0 * scale
+    z_hi = (core_row0 + nrows) * scale
+
+    cx_min = (x_lo + 15) // 16   # ceil(x_lo / 16)
+    cx_max = (x_hi + 15) // 16   # ceil(x_hi / 16) — exclusive
+    cz_min = (z_lo + 15) // 16
+    cz_max = (z_hi + 15) // 16
+
+    for cz in range(cz_min, cz_max):
+        for cx in range(cx_min, cx_max):
+            yield cx, cz
+
+
+def resolve_spawn_elev(spawn_row, spawn_col, headers, tile_index, min_east, max_north):
+    """
+    Return the elevation at a global (row, col) cell by loading just the tile
+    that contains it. Avoids loading the full stitched grid for spawn lookup.
+    Returns 0.0 if the cell is off-coverage.
+    """
+    # Probe the tile_index: a tile owns cells in [row0, row0 + nrows) x
+    # [col0, col0 + ncols). Since we don't know nrows/ncols a priori, iterate
+    # — the dict is small (one entry per tile).
+    for (row0, col0), key in tile_index.items():
+        hdr, zp = headers[key]
         nrows = int(hdr["nrows"])
-        nodata = hdr.get("nodata_value", -9999)
-
-        # Map this tile's SW corner to grid indices
-        col_offset = round((xll - min_east)  / CELL_SIZE_M)
-        # Tile's northernmost row → grid row offset (grid row 0 = northernmost overall)
-        row_offset = round((max_north - (yll + nrows * CELL_SIZE_M)) / CELL_SIZE_M)
-
-        arr = np.array(rows, dtype=np.float32)
-        arr[arr == nodata] = np.nan
-        # ASC row 0 = northernmost, col 0 = westernmost — matches our grid convention
-        grid[row_offset:row_offset + nrows, col_offset:col_offset + ncols] = arr
-
-    # Replace NaN (sea / missing) with 0
-    grid = np.where(np.isnan(grid), 0.0, grid)
-    return grid, min_east, max_north
+        ncols = int(hdr["ncols"])
+        if row0 <= spawn_row < row0 + nrows and col0 <= spawn_col < col0 + ncols:
+            _, _, arr = _load_tile_elev(zp)
+            return float(arr[spawn_row - row0, spawn_col - col0])
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -291,37 +379,33 @@ def _flat_area_mask(grid, window, range_threshold):
     return local_range < range_threshold
 
 
-def load_water_mask(zip_entries, grid, min_east, max_north, tiles_dir,
-                    tiff_threshold=TIFF_WATER_THRESHOLD,
-                    flat_window=FLAT_WINDOW,
-                    flat_range=FLAT_RANGE_M):
+def _iter_neighbour_tiffs(headers, tile_index, core_row0, core_col0, nrows, ncols,
+                          tiles_dir, cell_size_px, predicate_fraction_fn):
     """
-    Build a boolean water mask, same shape as `grid`.
+    Yield (frac_array, global_row_offset, global_col_offset) for every TIFF
+    quadrant belonging to this tile and its 8 neighbours. `predicate_fraction_fn`
+    is one of _tile_water_fraction / _tile_building_fraction.
 
-    A cell is water if either:
-      * the matching 50 m x 50 m block of the OS raster TIFF is mostly blue; or
-      * its local 5 x 5 elevation window has a range below `flat_range`
-        (this catches lochs and reservoirs, which show a single flat elevation).
+    Used by water_mask_for_tile and building_mask_for_tile so both share the
+    neighbour-walking + quadrant-locating boilerplate.
     """
-    grid_rows, grid_cols = grid.shape
-    mask = np.zeros((grid_rows, grid_cols), dtype=bool)
-
-    # --- TIFF blue detection ---
-    if tiles_dir and os.path.isdir(tiles_dir):
-        print(f"Detecting water from map TIFFs in {tiles_dir}...")
-        missing = 0
-        for zp, e_digit, n_digit, region in tqdm(zip_entries, unit="tile"):
-            try:
-                hdr, _ = _load_zip(zp)
-            except Exception:
+    if not (tiles_dir and os.path.isdir(tiles_dir)):
+        return
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            nkey = tile_index.get((core_row0 + dr * nrows, core_col0 + dc * ncols))
+            if nkey is None:
                 continue
-            ncols, nrows = int(hdr["ncols"]), int(hdr["nrows"])
-            col_offset = round((hdr["xllcorner"] - min_east) / CELL_SIZE_M)
-            row_offset = round((max_north - (hdr["yllcorner"] + nrows * CELL_SIZE_M)) / CELL_SIZE_M)
+            e_digit, n_digit, region = nkey
+            n_hdr, _zp = headers[nkey]
+            n_nrows = int(n_hdr["nrows"])
+            n_ncols = int(n_hdr["ncols"])
+            n_row0 = core_row0 + dr * nrows
+            n_col0 = core_col0 + dc * ncols
 
             tile_code = f"{region.upper()}{e_digit}{n_digit}"
             region_up = region.upper()
-            half_rows, half_cols = nrows // 2, ncols // 2
+            half_rows, half_cols = n_nrows // 2, n_ncols // 2
             quadrants = [
                 ("NW", 0,         0),
                 ("NE", 0,         half_cols),
@@ -331,97 +415,94 @@ def load_water_mask(zip_entries, grid, min_east, max_north, tiles_dir,
             for quad, q_row, q_col in quadrants:
                 tif_path = os.path.join(tiles_dir, region_up, f"{tile_code}{quad}.tif")
                 if not os.path.isfile(tif_path):
-                    missing += 1
                     continue
                 try:
-                    frac = _tile_water_fraction(tif_path, cell_size_px=CELL_SIZE_M * TIFF_PX_PER_M)
+                    frac = predicate_fraction_fn(tif_path, cell_size_px=cell_size_px)
                 except Exception as ex:
                     tqdm.write(f"  Warning: {os.path.basename(tif_path)}: {ex}")
                     continue
-                qh, qw = frac.shape
-                r0, c0 = row_offset + q_row, col_offset + q_col
-                r1, c1 = min(r0 + qh, grid_rows), min(c0 + qw, grid_cols)
-                if r1 > r0 and c1 > c0:
-                    mask[r0:r1, c0:c1] |= frac[:r1 - r0, :c1 - c0] > tiff_threshold
-        if missing:
-            print(f"  ({missing} quadrant TIFFs missing — OK if the area is off-coverage)")
-    else:
-        print("Skipping TIFF water detection (tiles directory not found).")
+                yield frac, n_row0 + q_row, n_col0 + q_col
 
-    # --- Flat-area detection (inland lochs, reservoirs) ---
-    print("Detecting water from flat elevation regions...")
-    flat = _flat_area_mask(grid, flat_window, flat_range)
-    mask |= flat
 
-    n_water = int(mask.sum())
-    print(f"Water cells: {n_water:,} / {mask.size:,}  ({100 * n_water / mask.size:.1f}%)")
+def water_mask_for_tile(tile_grid, core_row0, core_col0, nrows, ncols, halo,
+                        headers, tile_index, tiles_dir,
+                        tiff_threshold=TIFF_WATER_THRESHOLD,
+                        flat_window=FLAT_WINDOW,
+                        flat_range=FLAT_RANGE_M):
+    """
+    Build a boolean water mask aligned to tile_grid (core + halo). A local
+    cell is water if:
+      * the matching 50 m block of an OS raster TIFF is mostly blue; or
+      * its 5x5 elevation window is flat (inland lochs/reservoirs).
+
+    TIFF scan covers this tile plus any of its 8 neighbours whose quadrants
+    reach into the halo band — prevents seams when water hugs the tile edge.
+    """
+    mask = np.zeros(tile_grid.shape, dtype=bool)
+    mask_row0 = core_row0 - halo   # global row of mask[0, 0]
+    mask_col0 = core_col0 - halo
+
+    for frac, g_r0, g_c0 in _iter_neighbour_tiffs(
+            headers, tile_index, core_row0, core_col0, nrows, ncols,
+            tiles_dir, CELL_SIZE_M * TIFF_PX_PER_M, _tile_water_fraction):
+        qh, qw = frac.shape
+        # Intersect [g_r0, g_r0+qh) x [g_c0, g_c0+qw) with the local mask.
+        l_r0 = max(0, g_r0 - mask_row0)
+        l_r1 = min(mask.shape[0], g_r0 + qh - mask_row0)
+        l_c0 = max(0, g_c0 - mask_col0)
+        l_c1 = min(mask.shape[1], g_c0 + qw - mask_col0)
+        if l_r1 <= l_r0 or l_c1 <= l_c0:
+            continue
+        f_r0 = l_r0 - (g_r0 - mask_row0)
+        f_c0 = l_c0 - (g_c0 - mask_col0)
+        mask[l_r0:l_r1, l_c0:l_c1] |= frac[f_r0:f_r0 + (l_r1 - l_r0),
+                                           f_c0:f_c0 + (l_c1 - l_c0)] > tiff_threshold
+
+    # Flat-area detection over the halo-inclusive grid so window results near
+    # the core boundary still have neighbour data available.
+    mask |= _flat_area_mask(tile_grid, flat_window, flat_range)
     return mask
 
 
-def load_building_mask(zip_entries, grid, min_east, max_north, tiles_dir,
-                       tiff_threshold=TIFF_BUILDING_THRESHOLD):
+def building_mask_for_tile(core_row0, core_col0, nrows, ncols, halo,
+                           headers, tile_index, tiles_dir,
+                           tiff_threshold=TIFF_BUILDING_THRESHOLD):
     """
-    Build a boolean building mask from the OS raster TIFFs, at BUILDING_SUBCELL_M
-    resolution (10x denser than the elevation grid). A sub-cell is flagged when
-    the fraction of peach (#f8d8b8) pixels within its
-    BUILDING_SUBCELL_M x BUILDING_SUBCELL_M footprint exceeds `tiff_threshold`.
+    Build a boolean building mask at BUILDING_SUBCELL_M resolution, covering
+    the tile's core + halo. Shape: ((nrows + 2H) * K, (ncols + 2H) * K) where
+    K = CELL_SIZE_M // BUILDING_SUBCELL_M = 10.
 
-    Shape: (grid_rows * K, grid_cols * K) where K = CELL_SIZE_M // BUILDING_SUBCELL_M.
+    Halo coverage matters here because owned chunks on the east/south edge
+    can contain blocks whose sub-cell footprint falls a few cells past the
+    tile boundary (especially at high --scale).
     """
-    grid_rows, grid_cols = grid.shape
     K = CELL_SIZE_M // BUILDING_SUBCELL_M
-    mask = np.zeros((grid_rows * K, grid_cols * K), dtype=bool)
-
+    mask_rows = (nrows + 2 * halo) * K
+    mask_cols = (ncols + 2 * halo) * K
+    mask = np.zeros((mask_rows, mask_cols), dtype=bool)
     if not (tiles_dir and os.path.isdir(tiles_dir)):
-        print("Skipping building detection (tiles directory not found).")
         return mask
 
-    print(f"Detecting buildings from map TIFFs in {tiles_dir} "
-          f"(sub-cell {BUILDING_SUBCELL_M} m)...")
+    mask_row0_sub = (core_row0 - halo) * K
+    mask_col0_sub = (core_col0 - halo) * K
     subcell_px = BUILDING_SUBCELL_M * TIFF_PX_PER_M
-    missing = 0
-    for zp, e_digit, n_digit, region in tqdm(zip_entries, unit="tile"):
-        try:
-            hdr, _ = _load_zip(zp)
-        except Exception:
+
+    for frac, g_r0, g_c0 in _iter_neighbour_tiffs(
+            headers, tile_index, core_row0, core_col0, nrows, ncols,
+            tiles_dir, subcell_px, _tile_building_fraction):
+        qh, qw = frac.shape  # sub-cells
+        g_r0_sub = g_r0 * K
+        g_c0_sub = g_c0 * K
+        l_r0 = max(0, g_r0_sub - mask_row0_sub)
+        l_r1 = min(mask_rows, g_r0_sub + qh - mask_row0_sub)
+        l_c0 = max(0, g_c0_sub - mask_col0_sub)
+        l_c1 = min(mask_cols, g_c0_sub + qw - mask_col0_sub)
+        if l_r1 <= l_r0 or l_c1 <= l_c0:
             continue
-        ncols, nrows = int(hdr["ncols"]), int(hdr["nrows"])
-        col_offset = round((hdr["xllcorner"] - min_east) / CELL_SIZE_M)
-        row_offset = round((max_north - (hdr["yllcorner"] + nrows * CELL_SIZE_M)) / CELL_SIZE_M)
-
-        tile_code = f"{region.upper()}{e_digit}{n_digit}"
-        region_up = region.upper()
-        half_rows, half_cols = nrows // 2, ncols // 2
-        quadrants = [
-            ("NW", 0,         0),
-            ("NE", 0,         half_cols),
-            ("SW", half_rows, 0),
-            ("SE", half_rows, half_cols),
-        ]
-        for quad, q_row, q_col in quadrants:
-            tif_path = os.path.join(tiles_dir, region_up, f"{tile_code}{quad}.tif")
-            if not os.path.isfile(tif_path):
-                missing += 1
-                continue
-            try:
-                frac = _tile_building_fraction(tif_path, cell_size_px=subcell_px)
-            except Exception as ex:
-                tqdm.write(f"  Warning: {os.path.basename(tif_path)}: {ex}")
-                continue
-            qh, qw = frac.shape   # in sub-cells
-            # Quadrant offset in sub-cells from the global origin
-            r0 = (row_offset + q_row) * K
-            c0 = (col_offset + q_col) * K
-            r1 = min(r0 + qh, grid_rows * K)
-            c1 = min(c0 + qw, grid_cols * K)
-            if r1 > r0 and c1 > c0:
-                mask[r0:r1, c0:c1] |= frac[:r1 - r0, :c1 - c0] > tiff_threshold
-    if missing:
-        print(f"  ({missing} quadrant TIFFs missing — OK if the area is off-coverage)")
-
-    n_bld = int(mask.sum())
-    print(f"Building sub-cells: {n_bld:,} / {mask.size:,}  "
-          f"({100 * n_bld / mask.size:.2f}%)")
+        f_r0 = l_r0 - (g_r0_sub - mask_row0_sub)
+        f_c0 = l_c0 - (g_c0_sub - mask_col0_sub)
+        mask[l_r0:l_r1, l_c0:l_c1] |= frac[f_r0:f_r0 + (l_r1 - l_r0),
+                                           f_c0:f_c0 + (l_c1 - l_c0)] > tiff_threshold
     return mask
 
 
@@ -451,21 +532,22 @@ def _draw_line_cells(mask, c0, r0, c1, r1):
             r0 += sr
 
 
-def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
-                    forms=("canal", "inlandRiver", "tidalRiver")):
+def rasterize_rivers_for_tile(mask_shape, local_min_east, local_max_north, mbtiles_path,
+                              forms=("canal", "inlandRiver", "tidalRiver"),
+                              conn=None):
     """
-    Rasterize OS Open Rivers centrelines into a boolean mask aligned with the
-    elevation grid. Returns None if the mapbox-vector-tile package is missing.
+    Rasterize OS Open Rivers centrelines into a boolean mask covering the
+    BNG rectangle starting at (local_min_east, local_max_north) with
+    mask_shape = (rows, cols). Typically called per-tile with the tile's
+    halo-inclusive bbox so the mask aligns with tile_grid.
 
-    mbtiles_path is a SQLite MBTiles file of zoom 9-14 MVT tiles. We only read
-    zoom 14 for full resolution. Lines are transformed from Web Mercator pixel
-    coords → WGS84 → BNG (EPSG:27700) → cell indices.
+    Returns None if mapbox-vector-tile is missing, or a boolean array of
+    `mask_shape` otherwise. Pass `conn` to reuse an open sqlite connection
+    across tiles (caller is responsible for opening/closing).
     """
     try:
         import mapbox_vector_tile
     except ImportError:
-        print("  Skipping rivers: 'mapbox-vector-tile' not installed  "
-              "(pip install mapbox-vector-tile).")
         return None
 
     import gzip as _gzip
@@ -473,9 +555,9 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
     import sqlite3
     from pyproj import Transformer
 
-    grid_rows, grid_cols = grid_shape
-    max_east  = min_east + grid_cols * CELL_SIZE_M
-    min_north = max_north - grid_rows * CELL_SIZE_M
+    mask_rows, mask_cols = mask_shape
+    local_max_east  = local_min_east + mask_cols * CELL_SIZE_M
+    local_min_north = local_max_north - mask_rows * CELL_SIZE_M
 
     to_wgs84 = Transformer.from_crs("EPSG:27700", "EPSG:4326", always_xy=True)
     to_bng   = Transformer.from_crs("EPSG:4326",  "EPSG:27700", always_xy=True)
@@ -489,22 +571,22 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
         ty = int((1 - _math.log(_math.tan(lat_rad) + 1 / _math.cos(lat_rad)) / _math.pi) / 2 * n_tiles)
         return tx, ty
 
-    # Sample a 5x5 grid across the BNG bounds — edges aren't straight in WGS84,
-    # so corner-only sampling can miss tiles along curved borders.
     samples = []
-    for f_e in np.linspace(min_east, max_east, 5):
-        for f_n in np.linspace(min_north, max_north, 5):
+    for f_e in np.linspace(local_min_east, local_max_east, 5):
+        for f_n in np.linspace(local_min_north, local_max_north, 5):
             lon, lat = to_wgs84.transform(f_e, f_n)
             samples.append(lonlat_to_tile(lon, lat))
     txs, tys = zip(*samples)
     tx_min, tx_max = min(txs), max(txs)
     ty_min, ty_max = min(tys), max(tys)
 
-    # MBTiles stores tile_row in TMS convention (flipped from XYZ).
     tms_y_min = n_tiles - 1 - ty_max
     tms_y_max = n_tiles - 1 - ty_min
 
-    conn = sqlite3.connect(mbtiles_path)
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(mbtiles_path)
+        close_conn = True
     cur = conn.cursor()
     cur.execute(
         "SELECT tile_column, tile_row, tile_data FROM tiles "
@@ -513,15 +595,12 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
         (zoom, tx_min, tx_max, tms_y_min, tms_y_max),
     )
     tile_rows = cur.fetchall()
-    conn.close()
+    if close_conn:
+        conn.close()
 
-    print(f"Loading rivers from {os.path.basename(mbtiles_path)} "
-          f"({len(tile_rows)} MVT tiles at z{zoom})...")
+    mask = np.zeros(mask_shape, dtype=bool)
 
-    mask = np.zeros(grid_shape, dtype=bool)
-    n_segments = 0
-
-    for tile_col, tile_row, raw in tqdm(tile_rows, unit="tile", leave=False):
+    for tile_col, tile_row, raw in tile_rows:
         tx = tile_col
         ty = n_tiles - 1 - tile_row
         try:
@@ -529,9 +608,8 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
         except OSError:
             pbf = raw
         try:
-            decoded = mapbox_vector_tile.decode(pbf, y_coord_down=True)
-        except Exception as ex:
-            tqdm.write(f"  Warning: tile {tx},{tile_row} decode failed: {ex}")
+            decoded = mapbox_vector_tile.decode(pbf, default_options={"y_coord_down": True})
+        except Exception:
             continue
         layer = decoded.get("watercourse_link")
         if not layer:
@@ -552,7 +630,6 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
         if not all_lines:
             continue
 
-        # Flatten all vertices so pyproj can batch-transform in one call.
         flat_lon, flat_lat, segments = [], [], []
         for line in all_lines:
             start = len(flat_lon)
@@ -565,8 +642,8 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
             segments.append((start, len(flat_lon)))
 
         es, ns = to_bng.transform(flat_lon, flat_lat)
-        cs = np.floor((np.asarray(es) - min_east)  / CELL_SIZE_M).astype(np.int32)
-        rs = np.floor((max_north - np.asarray(ns)) / CELL_SIZE_M).astype(np.int32)
+        cs = np.floor((np.asarray(es) - local_min_east)  / CELL_SIZE_M).astype(np.int32)
+        rs = np.floor((local_max_north - np.asarray(ns)) / CELL_SIZE_M).astype(np.int32)
 
         for start, end in segments:
             if end - start < 2:
@@ -574,10 +651,7 @@ def load_river_mask(grid_shape, min_east, max_north, mbtiles_path,
             for i in range(start, end - 1):
                 _draw_line_cells(mask, int(cs[i]), int(rs[i]),
                                  int(cs[i + 1]), int(rs[i + 1]))
-            n_segments += 1
 
-    n_cells = int(mask.sum())
-    print(f"  River cells: {n_cells:,} from {n_segments} segments")
     return mask
 
 
@@ -641,25 +715,26 @@ def _biome_name(elev_m):
 ARRAY_OFFSET = -Y_MIN   # = 64; array index = Y + ARRAY_OFFSET
 ARRAY_HEIGHT = Y_MAX - Y_MIN + 1  # = 384
 
-def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
+def generate_chunk(cx, cz, tile_grid, tile_origin, scale, vscale, block_uni, biome_mode,
                    water_mask=None, water_density=None,
                    building_mask=None,
+                   world_rows=None, world_cols=None,
                    mc_width=None, mc_depth=None):
     """
     Build and return an amulet Chunk for chunk coordinates (cx, cz).
-    block_uni: dict name -> universal Block object.
 
-    If `water_mask` is given, cells where it is True have their top block
-    replaced with water (lochs get a single water block at the loch surface).
+    `tile_grid` is the halo-inclusive elevation grid for the owning tile;
+    `tile_origin = (row, col)` is the global cell index of tile_grid[0, 0].
+    The halo must be wide enough to cover every cell this chunk reads — see
+    chunks_owned_by_tile / load_tile_with_halo.
 
-    If `building_mask` is given (at BUILDING_SUBCELL_M resolution — 10x denser
-    than `grid`), blocks whose footprint maps to a flagged sub-cell get a
-    short stack of bricks (BUILDING_HEIGHT_BLOCKS blocks) placed above the
-    surface. Buildings lose to water: blocks flagged as both stay water.
+    `water_mask` / `water_density` share tile_grid's shape. `building_mask` is
+    K-times denser (K = CELL_SIZE_M // BUILDING_SUBCELL_M) and covers the same
+    halo-inclusive extent.
 
-    If `mc_width`/`mc_depth` are given, edge columns that contain water are
-    capped with stone up to one block above the local water level — just
-    enough to stop water escaping into the surrounding void.
+    `world_rows` / `world_cols` are the global cell dimensions, used to mark
+    blocks past the world edge as elev=0. `mc_width` / `mc_depth` are global
+    block dimensions used for the perimeter rim.
     """
     chunk = Chunk(cx, cz)
     pal = chunk.block_palette
@@ -691,7 +766,13 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
         "sandstone": SANDS_ID,
     }
 
-    grid_rows, grid_cols = grid.shape
+    t_row0, t_col0 = tile_origin
+    tg_rows, tg_cols = tile_grid.shape
+    # If world dims aren't supplied, fall back to the local grid shape
+    # (single-tile standalone use).
+    w_rows = world_rows if world_rows is not None else tg_rows
+    w_cols = world_cols if world_cols is not None else tg_cols
+    K_BLD = CELL_SIZE_M // BUILDING_SUBCELL_M
 
     # Build a full-height column array: shape (16, ARRAY_HEIGHT, 16)
     # Index [lx, y_arr, lz] where y_arr = Y + ARRAY_OFFSET
@@ -705,11 +786,11 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
             gx = cx * 16 + lx   # global block X
             gz = cz * 16 + lz   # global block Z
 
-            # Map block coords → cell coords (integer, for bounds check)
+            # Map block coords → global cell coords (integer, for bounds check)
             cell_col = gx // scale
             cell_row = gz // scale
 
-            in_bounds = 0 <= cell_row < grid_rows and 0 <= cell_col < grid_cols
+            in_bounds = 0 <= cell_row < w_rows and 0 <= cell_col < w_cols
 
             if not in_bounds:
                 elev = 0.0
@@ -723,17 +804,18 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
                 fz = (gz + 0.5) / scale - 0.5
                 c0 = int(np.floor(fx)); r0 = int(np.floor(fz))
                 tx = fx - c0;           tz = fz - r0
-                c0c = max(0, min(grid_cols - 1, c0))
-                c1c = max(0, min(grid_cols - 1, c0 + 1))
-                r0c = max(0, min(grid_rows - 1, r0))
-                r1c = max(0, min(grid_rows - 1, r0 + 1))
+                # Clamp to world bounds, then translate into tile_grid local.
+                c0c = max(0, min(w_cols - 1, c0))     - t_col0
+                c1c = max(0, min(w_cols - 1, c0 + 1)) - t_col0
+                r0c = max(0, min(w_rows - 1, r0))     - t_row0
+                r1c = max(0, min(w_rows - 1, r0 + 1)) - t_row0
                 w00 = (1 - tx) * (1 - tz)
                 w01 = tx       * (1 - tz)
                 w10 = (1 - tx) * tz
                 w11 = tx       * tz
                 elev = float(
-                    w00 * grid[r0c, c0c] + w01 * grid[r0c, c1c]
-                    + w10 * grid[r1c, c0c] + w11 * grid[r1c, c1c]
+                    w00 * tile_grid[r0c, c0c] + w01 * tile_grid[r0c, c1c]
+                    + w10 * tile_grid[r1c, c0c] + w11 * tile_grid[r1c, c1c]
                 )
                 if water_density is not None:
                     wm = (w00 * water_density[r0c, c0c] + w01 * water_density[r0c, c1c]
@@ -742,9 +824,11 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
                 else:
                     is_mask_water_cell = False
             else:
-                elev = float(grid[cell_row, cell_col])
+                lr = cell_row - t_row0
+                lc = cell_col - t_col0
+                elev = float(tile_grid[lr, lc])
                 is_mask_water_cell = (
-                    water_mask is not None and bool(water_mask[cell_row, cell_col])
+                    water_mask is not None and bool(water_mask[lr, lc])
                 )
 
             # Buildings use a separate sub-cell mask (BUILDING_SUBCELL_M).
@@ -753,8 +837,8 @@ def generate_chunk(cx, cz, grid, scale, vscale, block_uni, biome_mode,
             is_mask_building_cell = False
             if in_bounds and building_mask is not None:
                 mr, mc = building_mask.shape
-                sub_col = int((gx + 0.5) * CELL_SIZE_M / (scale * BUILDING_SUBCELL_M))
-                sub_row = int((gz + 0.5) * CELL_SIZE_M / (scale * BUILDING_SUBCELL_M))
+                sub_col = int((gx + 0.5) * CELL_SIZE_M / (scale * BUILDING_SUBCELL_M)) - t_col0 * K_BLD
+                sub_row = int((gz + 0.5) * CELL_SIZE_M / (scale * BUILDING_SUBCELL_M)) - t_row0 * K_BLD
                 if 0 <= sub_row < mr and 0 <= sub_col < mc:
                     is_mask_building_cell = bool(building_mask[sub_row, sub_col])
 
@@ -1131,6 +1215,14 @@ def main():
     parser.add_argument("--rivers-path", default=None,
                         help="Path to OS Open Rivers .mbtiles "
                              "(default: '<input-parent>/../rivers/Data/oprvrs_gb.mbtiles').")
+    parser.add_argument("--halo", type=int, default=None,
+                        help="Halo cells loaded around each tile for seamless bilinear / flat-area "
+                             "detection. Defaults to ceil(16 / scale) + 3 (19 at scale=1, 5 at "
+                             "scale=8). Bigger values cost more zip reads per tile.")
+    parser.add_argument("--flush-every", type=int, default=1,
+                        help="Flush amulet's in-memory chunk cache every N tiles. Default 1 "
+                             "(flush after each tile) for minimum memory. Higher = fewer saves "
+                             "but more RAM.")
     args = parser.parse_args()
 
     # --- Discover tiles ---
@@ -1150,84 +1242,51 @@ def main():
         shutil.rmtree(out_path)
     os.makedirs(out_path, exist_ok=True)
 
-    # --- Load elevation grid ---
-    grid, origin_easting, origin_northing_top = load_elevation_grid(zip_entries)
-    grid_rows, grid_cols = grid.shape
+    # --- Headers + global extent (cheap — reads only header bytes) ---
+    headers = scan_headers(zip_entries)
+    origin_easting, origin_northing_top, total_rows, total_cols = compute_global_extent(headers)
+    tile_index = build_tile_index(headers, origin_easting, origin_northing_top)
+    print(f"Grid: {total_cols} x {total_rows} cells  "
+          f"({total_cols*CELL_SIZE_M/1000:.0f} km x {total_rows*CELL_SIZE_M/1000:.0f} km)")
+
+    # --- Halo size ---
+    # ceil(16 / scale) covers chunk blocks that extend past the tile edge,
+    # +1 for bilinear neighbour, +2 for the 5x5 flat-area window.
+    halo = args.halo if args.halo is not None else ceil(16 / args.scale) + 3
+    print(f"Halo: {halo} cells per side")
 
     # --- Resolve tiles dir (shared by water + buildings detection) ---
-    # Default tiles dir is a sibling of the data folder: .../OS Map Data/tiles
     if args.tiles_dir:
         tiles_dir = args.tiles_dir
     else:
         first_zip_dir = os.path.dirname(zip_entries[0][0])
         tiles_dir = os.path.normpath(os.path.join(first_zip_dir, "..", "..", "tiles"))
 
-    # --- Load water mask ---
-    water_mask = None
-    if not args.no_water:
-        water_mask = load_water_mask(zip_entries, grid, origin_easting,
-                                     origin_northing_top, tiles_dir)
-
-    # --- Load rivers (OS Open Rivers vector data) ---
-    # Only meaningful at scale >= 4: at scale 1 a single-cell line is 50 m wide,
-    # which makes every stream look like a small lake.
-    river_mask = None
-    if not args.no_rivers:
-        if args.scale < 4:
-            print(f"Skipping rivers (--scale {args.scale} < 4 — lines would be too fat).")
+    # --- Resolve rivers path (opened per-tile below) ---
+    do_rivers = (not args.no_rivers) and args.scale >= 4
+    rivers_path = None
+    if do_rivers:
+        if args.rivers_path:
+            rivers_path = args.rivers_path
         else:
-            if args.rivers_path:
-                rivers_path = args.rivers_path
-            else:
-                first_zip_dir = os.path.dirname(zip_entries[0][0])
-                rivers_path = os.path.normpath(os.path.join(
-                    first_zip_dir, "..", "..", "rivers", "Data", "oprvrs_gb.mbtiles"))
-            if os.path.isfile(rivers_path):
-                river_mask = load_river_mask(
-                    grid.shape, origin_easting, origin_northing_top, rivers_path)
-                if river_mask is not None:
-                    water_mask = river_mask if water_mask is None else (water_mask | river_mask)
-            else:
-                print(f"Rivers file not found at {rivers_path} — skipping.")
+            first_zip_dir = os.path.dirname(zip_entries[0][0])
+            rivers_path = os.path.normpath(os.path.join(
+                first_zip_dir, "..", "..", "rivers", "Data", "oprvrs_gb.mbtiles"))
+        if not os.path.isfile(rivers_path):
+            print(f"Rivers file not found at {rivers_path} — skipping.")
+            rivers_path = None
+            do_rivers = False
+    elif not args.no_rivers and args.scale < 4:
+        print(f"Skipping rivers (--scale {args.scale} < 4 — lines would be too fat).")
 
-    # Pre-blur the water mask with a 3x3 Gaussian-ish kernel so bilinear
-    # sampling rounds off corners of small ponds/lochs instead of producing
-    # diamond-shaped blobs. Interior of wide water bodies stays at density 1.0.
-    water_density = None
-    if water_mask is not None:
-        m = water_mask.astype(np.float32)
-        p = np.pad(m, 1, mode="edge")
-        water_density = (
-            1 * p[:-2, :-2] + 2 * p[:-2, 1:-1] + 1 * p[:-2, 2:]
-            + 2 * p[1:-1, :-2] + 4 * p[1:-1, 1:-1] + 2 * p[1:-1, 2:]
-            + 1 * p[2:, :-2] + 2 * p[2:, 1:-1] + 1 * p[2:, 2:]
-        ) / 16.0
-        # Floor every True water cell's density at WATER_CELL_FLOOR so isolated
-        # 1-2 cell ponds (e.g. Blackford Pond) don't blur below the 0.5 threshold
-        # and vanish at --scale 4/8. Large water bodies keep their natural blur
-        # (interior True cells already ≥ 0.75), so loch edges stay rounded.
-        water_density = np.maximum(water_density, m * WATER_CELL_FLOOR)
-        # Rivers are 1-cell-wide lines: pin to 1.0 so they stay continuous through
-        # bilinear sampling instead of breaking up into dots between cells.
-        if river_mask is not None:
-            water_density[river_mask] = 1.0
-
-    # --- Load building mask ---
-    # Auto-off below MIN_BUILDING_SCALE because a 50 m cell resolves to <1 block,
-    # so individual buildings are smaller than the block grid.
-    building_mask = None
-    if args.buildings:
-        if args.scale < MIN_BUILDING_SCALE:
-            print(f"Skipping buildings (--scale {args.scale} < {MIN_BUILDING_SCALE} "
-                  "— each cell resolves to <1 block).")
-        else:
-            building_mask = load_building_mask(zip_entries, grid, origin_easting,
-                                               origin_northing_top, tiles_dir)
+    do_buildings = args.buildings and args.scale >= MIN_BUILDING_SCALE
+    if args.buildings and args.scale < MIN_BUILDING_SCALE:
+        print(f"Skipping buildings (--scale {args.scale} < {MIN_BUILDING_SCALE} "
+              "— each cell resolves to <1 block).")
 
     # --- Resolve spawn (needed before patch_level_dat) ---
-    # Default spawn: centre of the map. --spawn overrides with a WGS84 coord.
-    spawn_col = grid_cols // 2
-    spawn_row = grid_rows // 2
+    spawn_col = total_cols // 2
+    spawn_row = total_rows // 2
     if args.spawn:
         try:
             lat_s, lon_s = args.spawn.split(",")
@@ -1239,13 +1298,14 @@ def main():
             east, north = wgs84_to_bng(lat, lon)
             col = int((east - origin_easting) / CELL_SIZE_M)
             row = int((origin_northing_top - north) / CELL_SIZE_M)
-            if 0 <= col < grid_cols and 0 <= row < grid_rows:
+            if 0 <= col < total_cols and 0 <= row < total_rows:
                 spawn_col, spawn_row = col, row
                 print(f"Spawn set from {lat}, {lon} -> grid cell ({col}, {row}).")
             else:
                 print(f"Spawn coord {lat}, {lon} (BNG {east:.0f}E {north:.0f}N) "
                       f"is outside the generated map — using map centre.")
-    spawn_elev = float(grid[spawn_row, spawn_col])
+    spawn_elev = resolve_spawn_elev(spawn_row, spawn_col, headers, tile_index,
+                                    origin_easting, origin_northing_top)
     spawn_x = (spawn_col * args.scale) + (args.scale // 2)
     spawn_z = (spawn_row * args.scale) + (args.scale // 2)
     spawn_y = MAP_ZERO_Y + round(spawn_elev * args.vscale) + 1
@@ -1261,31 +1321,85 @@ def main():
     # missing (as it is in amulet's fresh create_and_open output), it falls
     # back to DefaultSelection (Y=0..256) and every saved chunk gets truncated
     # to 16 sections, silently dropping anything above Y=255 or below Y=0.
-    # Writing the overworld/nether/end dimension references now lets amulet
-    # detect the 1.18+ (-64..319) bounds before any chunks are encoded.
     patch_level_dat(out_path, world_name, spawn_x, spawn_y, spawn_z, void=args.void)
 
     level = amulet.load_level(out_path)
-
-    # Build universal block palette (once, shared across chunks)
     block_uni = _make_palette(level)
 
-    # --- Determine chunk range ---
-    mc_width  = grid_cols * args.scale
-    mc_depth  = grid_rows * args.scale
-    cx_min, cx_max = 0, ceil(mc_width  / 16)
-    cz_min, cz_max = 0, ceil(mc_depth  / 16)
-    total_chunks = (cx_max - cx_min) * (cz_max - cz_min)
+    # --- World dimensions ---
+    mc_width  = total_cols * args.scale
+    mc_depth  = total_rows * args.scale
+    cx_max = ceil(mc_width  / 16)
+    cz_max = ceil(mc_depth  / 16)
+    total_chunks = cx_max * cz_max
 
     print(f"World size: {mc_width} x {mc_depth} blocks  ({total_chunks} chunks)")
     print(f"Scale: --scale {args.scale}  --vscale {args.vscale}  --biomes {args.biomes}")
-    print(f"Generating terrain...")
+    print(f"Streaming {len(headers)} tiles (flush every {args.flush_every})...")
+
+    # --- Rivers: open SQLite connection once, reuse across tiles ---
+    rivers_conn = None
+    if do_rivers:
+        import sqlite3
+        rivers_conn = sqlite3.connect(rivers_path)
+
+    elev_min, elev_max = float("inf"), float("-inf")
+    tiles_done = 0
 
     with tqdm(total=total_chunks, unit="chunk") as pbar:
-        for cz in range(cz_min, cz_max):
-            for cx in range(cx_min, cx_max):
+        for key in headers:
+            # Load elevation + halo for this tile
+            tile_grid, core_row0, core_col0, nrows, ncols = load_tile_with_halo(
+                key, headers, tile_index, origin_easting, origin_northing_top, halo)
+            tile_origin = (core_row0 - halo, core_col0 - halo)
+
+            # Track elevation range (core only — halo elevations are counted by
+            # the tiles that own them)
+            core_slice = tile_grid[halo:halo + nrows, halo:halo + ncols]
+            if core_slice.size:
+                elev_min = min(elev_min, float(core_slice.min()))
+                elev_max = max(elev_max, float(core_slice.max()))
+
+            # Masks for this tile
+            water_mask = None
+            if not args.no_water:
+                water_mask = water_mask_for_tile(
+                    tile_grid, core_row0, core_col0, nrows, ncols, halo,
+                    headers, tile_index, tiles_dir)
+
+            river_mask = None
+            if do_rivers:
+                local_min_east = origin_easting + (core_col0 - halo) * CELL_SIZE_M
+                local_max_north = origin_northing_top - (core_row0 - halo) * CELL_SIZE_M
+                river_mask = rasterize_rivers_for_tile(
+                    tile_grid.shape, local_min_east, local_max_north,
+                    rivers_path, conn=rivers_conn)
+                if river_mask is not None:
+                    water_mask = river_mask if water_mask is None else (water_mask | river_mask)
+
+            water_density = None
+            if water_mask is not None:
+                m = water_mask.astype(np.float32)
+                p = np.pad(m, 1, mode="edge")
+                water_density = (
+                    1 * p[:-2, :-2] + 2 * p[:-2, 1:-1] + 1 * p[:-2, 2:]
+                    + 2 * p[1:-1, :-2] + 4 * p[1:-1, 1:-1] + 2 * p[1:-1, 2:]
+                    + 1 * p[2:, :-2] + 2 * p[2:, 1:-1] + 1 * p[2:, 2:]
+                ) / 16.0
+                water_density = np.maximum(water_density, m * WATER_CELL_FLOOR)
+                if river_mask is not None:
+                    water_density[river_mask] = 1.0
+
+            building_mask = None
+            if do_buildings:
+                building_mask = building_mask_for_tile(
+                    core_row0, core_col0, nrows, ncols, halo,
+                    headers, tile_index, tiles_dir)
+
+            # Generate chunks owned by this tile
+            for cx, cz in chunks_owned_by_tile(core_row0, core_col0, nrows, ncols, args.scale):
                 chunk = generate_chunk(
-                    cx, cz, grid,
+                    cx, cz, tile_grid, tile_origin,
                     scale=args.scale,
                     vscale=args.vscale,
                     block_uni=block_uni,
@@ -1293,24 +1407,34 @@ def main():
                     water_mask=water_mask,
                     water_density=water_density,
                     building_mask=building_mask,
+                    world_rows=total_rows,
+                    world_cols=total_cols,
                     mc_width=mc_width,
                     mc_depth=mc_depth,
                 )
                 level.put_chunk(chunk, DIMENSION)
                 pbar.update(1)
 
-    # --- Save ---
+            tiles_done += 1
+            # Release mask references before the flush so the arrays can be GC'd
+            tile_grid = water_mask = water_density = building_mask = river_mask = None
+            if tiles_done % args.flush_every == 0:
+                level.save()
+                level.unload()
+
+    # Final flush for any residual chunks
     print("Saving world...")
     level.save()
     level.close()
 
+    if rivers_conn is not None:
+        rivers_conn.close()
+
     # --- Entity storage (required by Minecraft 1.17+) ---
-    write_entity_files(out_path, cx_min, cx_max, cz_min, cz_max)
+    write_entity_files(out_path, 0, cx_max, 0, cz_max)
 
     # --- Summary ---
     region_files = glob.glob(os.path.join(out_path, "region", "*.mca"))
-    elev_min = float(np.min(grid))
-    elev_max = float(np.max(grid))
     y_min_used = MAP_ZERO_Y + round(elev_min * args.vscale)
     y_max_used = MAP_ZERO_Y + round(elev_max * args.vscale)
 

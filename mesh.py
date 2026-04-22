@@ -28,7 +28,10 @@ from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from generate import discover_zips, load_elevation_grid, CELL_SIZE_M
+from generate import (
+    discover_zips, scan_headers, compute_global_extent, build_tile_index,
+    load_tile_with_halo, CELL_SIZE_M,
+)
 
 # ---------------------------------------------------------------------------
 # BNG code → easting/northing lookup (reverse of locate.py's tables)
@@ -119,56 +122,13 @@ def stitch_texture(zip_entries, grid_cols, grid_rows,
     return canvas
 
 # ---------------------------------------------------------------------------
-# Mesh generation
-# ---------------------------------------------------------------------------
-
-def build_mesh(grid, step, vscale):
-    """
-    Build a triangle mesh from the elevation grid.
-
-    Returns (vertices, uvs, faces):
-        vertices — (N, 3) float64, X = east, Y = elevation, Z = south
-        uvs      — (N, 2) float64, (u, v) in [0, 1]
-        faces    — (M, 3) int32,   triangle indices (0-based), wound for +Y normals
-    """
-    sampled = grid[::step, ::step]
-    rows, cols = sampled.shape
-
-    cc, rr = np.meshgrid(np.arange(cols), np.arange(rows))
-    x = cc.astype(np.float64) * step * CELL_SIZE_M
-    z = rr.astype(np.float64) * step * CELL_SIZE_M
-    y = sampled.astype(np.float64) * vscale
-
-    vertices = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
-
-    u = cc.astype(np.float64) / max(cols - 1, 1)
-    v = 1.0 - rr.astype(np.float64) / max(rows - 1, 1)
-    uvs = np.stack([u.ravel(), v.ravel()], axis=1)
-
-    # Two triangles per cell, wound for upward-facing normals (+Y)
-    rc2, rr2 = np.meshgrid(np.arange(cols - 1), np.arange(rows - 1))
-    tl = (rr2 * cols + rc2).ravel()
-    tr = tl + 1
-    bl = tl + cols
-    br = bl + 1
-
-    faces = np.concatenate([
-        np.stack([tl, bl, tr], axis=1),   # triangle 1
-        np.stack([bl, br, tr], axis=1),   # triangle 2
-    ])
-
-    return vertices, uvs, faces
-
-# ---------------------------------------------------------------------------
-# OBJ / MTL writer
+# OBJ / MTL writer — streamed per tile
 # ---------------------------------------------------------------------------
 
 WRITE_BATCH = 50_000
 
 
-def write_obj(out_dir, name, vertices, uvs, faces, tex_file):
-    """Write Wavefront OBJ + MTL files."""
-    # --- MTL ---
+def _write_mtl(out_dir, name, tex_file):
     mtl_path = os.path.join(out_dir, f"{name}.mtl")
     with open(mtl_path, "w") as f:
         f.write("newmtl terrain\n")
@@ -177,36 +137,114 @@ def write_obj(out_dir, name, vertices, uvs, faces, tex_file):
         f.write("Ks 0.0 0.0 0.0\n")
         f.write("illum 1\n")
         f.write(f"map_Kd {tex_file}\n")
+    return mtl_path
 
-    # --- OBJ ---
+
+def stream_obj(out_dir, name, headers, tile_index, origin_e, origin_n_top,
+               total_rows, total_cols, step, vscale, tex_file):
+    """
+    Write a Wavefront OBJ mesh tile-by-tile. Each tile emits vertices for its
+    core cells plus a 1-cell border from its east/south neighbours (via halo=1
+    on load_tile_with_halo) so boundary quads can be drawn without looking up
+    a neighbour's vertex indices later. Border vertices are duplicated between
+    adjacent tiles; this keeps the writer single-pass and memory-bounded at
+    one tile worth of data.
+
+    `step` subsamples within each tile; it is applied to the tile-local grid,
+    so users picking a step that doesn't divide 200 may see minor alignment
+    seams at tile boundaries.
+    """
     obj_path = os.path.join(out_dir, f"{name}.obj")
-    n_verts = len(vertices)
-    n_faces = len(faces)
-    print(f"Writing {n_verts:,} vertices, {n_faces:,} triangles...")
+    n_verts_total = 0
+    n_faces_total = 0
 
     with open(obj_path, "w", buffering=1 << 17) as f:
         f.write(f"# OS Terrain 50 mesh — {name}\n")
-        f.write(f"# {n_verts} vertices, {n_faces} faces\n")
         f.write(f"mtllib {name}.mtl\n")
         f.write(f"usemtl terrain\n\n")
 
-        for i in tqdm(range(0, n_verts, WRITE_BATCH), desc="Vertices", unit_scale=WRITE_BATCH):
-            batch = vertices[i:i + WRITE_BATCH]
-            f.writelines(f"v {v[0]:.2f} {v[1]:.2f} {v[2]:.2f}\n" for v in batch)
+        # Deterministic order — row-major by global NW cell.
+        keys_sorted = sorted(
+            headers.keys(),
+            key=lambda k: (-int(headers[k][0]["yllcorner"]), int(headers[k][0]["xllcorner"]))
+        )
 
-        f.write("\n")
-        for i in tqdm(range(0, n_verts, WRITE_BATCH), desc="UVs", unit_scale=WRITE_BATCH):
-            batch = uvs[i:i + WRITE_BATCH]
-            f.writelines(f"vt {t[0]:.6f} {t[1]:.6f}\n" for t in batch)
+        vertex_base = 0  # 0-based; OBJ face indices add 1
 
-        f.write("\n")
-        face_1 = faces + 1   # OBJ is 1-indexed
-        for i in tqdm(range(0, n_faces, WRITE_BATCH), desc="Faces", unit_scale=WRITE_BATCH):
-            batch = face_1[i:i + WRITE_BATCH]
-            f.writelines(f"f {a}/{a} {b}/{b} {c}/{c}\n" for a, b, c in batch)
+        for key in tqdm(keys_sorted, desc="Tiles", unit="tile"):
+            hdr, _ = headers[key]
+            nrows = int(hdr["nrows"])
+            ncols = int(hdr["ncols"])
 
-    print(f"Saved: {obj_path}")
-    print(f"Saved: {mtl_path}")
+            # Does a neighbour exist on the east/south edge?
+            core_row0 = round((origin_n_top - (hdr["yllcorner"] + nrows * CELL_SIZE_M)) / CELL_SIZE_M)
+            core_col0 = round((hdr["xllcorner"] - origin_e) / CELL_SIZE_M)
+            has_east  = (core_row0, core_col0 + ncols) in tile_index
+            has_south = (core_row0 + nrows, core_col0) in tile_index
+
+            # Load core + 1-cell south/east halo so boundary quads can reach
+            # into the neighbour. We still call load_tile_with_halo with halo=1
+            # (both sides) for symmetry — only the south/east halo cells are
+            # emitted as vertices; NW halo stays unused.
+            tile_grid, _core_r0, _core_c0, _nrows, _ncols = load_tile_with_halo(
+                key, headers, tile_index, origin_e, origin_n_top, halo=1)
+
+            # Slice starting at the core (drop the NW halo row/col).
+            ext_rows = nrows + (1 if has_south else 0)
+            ext_cols = ncols + (1 if has_east  else 0)
+            ext = tile_grid[1:1 + ext_rows, 1:1 + ext_cols]
+
+            # Apply step — vertices are sampled at rows [0, step, 2*step, ...]
+            # up to ext_rows-1. ceil((ext_rows-1)/step)+1 sampled rows.
+            s_rows = (ext_rows - 1) // step + 1
+            s_cols = (ext_cols - 1) // step + 1
+            if s_rows < 1 or s_cols < 1:
+                continue
+
+            # Emit vertices (v + vt in batches)
+            v_lines = []
+            vt_lines = []
+            for sr in range(s_rows):
+                local_r = sr * step
+                global_r = core_row0 + local_r
+                z_m = global_r * CELL_SIZE_M
+                for sc in range(s_cols):
+                    local_c = sc * step
+                    global_c = core_col0 + local_c
+                    x_m = global_c * CELL_SIZE_M
+                    y_m = float(ext[local_r, local_c]) * vscale
+                    u = global_c / max(total_cols - 1, 1)
+                    v = 1.0 - global_r / max(total_rows - 1, 1)
+                    v_lines.append(f"v {x_m:.2f} {y_m:.2f} {z_m:.2f}\n")
+                    vt_lines.append(f"vt {u:.6f} {v:.6f}\n")
+                    if len(v_lines) >= WRITE_BATCH:
+                        f.writelines(v_lines); v_lines.clear()
+                        f.writelines(vt_lines); vt_lines.clear()
+            if v_lines:
+                f.writelines(v_lines); f.writelines(vt_lines)
+
+            # Emit faces — (s_rows-1) * (s_cols-1) quads, two triangles each.
+            face_lines = []
+            for sr in range(s_rows - 1):
+                row_base = vertex_base + sr * s_cols
+                for sc in range(s_cols - 1):
+                    tl = row_base + sc + 1   # OBJ is 1-based
+                    tr = tl + 1
+                    bl = tl + s_cols
+                    br = bl + 1
+                    face_lines.append(f"f {tl}/{tl} {bl}/{bl} {tr}/{tr}\n")
+                    face_lines.append(f"f {bl}/{bl} {br}/{br} {tr}/{tr}\n")
+                    if len(face_lines) >= WRITE_BATCH:
+                        f.writelines(face_lines); face_lines.clear()
+            if face_lines:
+                f.writelines(face_lines)
+
+            n_verts_total += s_rows * s_cols
+            n_faces_total += 2 * max(0, s_rows - 1) * max(0, s_cols - 1)
+            vertex_base += s_rows * s_cols
+
+    print(f"Saved: {obj_path}  ({n_verts_total:,} vertices, {n_faces_total:,} triangles)")
+    return n_verts_total, n_faces_total
 
 # ---------------------------------------------------------------------------
 # Main
@@ -238,32 +276,30 @@ def main():
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "meshes", name)
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- Load elevation grid ---
-    grid, origin_e, origin_n_top = load_elevation_grid(zip_entries)
-    grid_rows, grid_cols = grid.shape
-    print(f"Elevation grid: {grid_cols} x {grid_rows} cells")
+    # --- Headers + global extent ---
+    headers = scan_headers(zip_entries)
+    origin_e, origin_n_top, total_rows, total_cols = compute_global_extent(headers)
+    tile_index = build_tile_index(headers, origin_e, origin_n_top)
+    print(f"Elevation grid: {total_cols} x {total_rows} cells")
 
-    # --- Build texture ---
-    texture = stitch_texture(zip_entries, grid_cols, grid_rows,
+    # --- Build texture (unchanged — PIL canvas is memory-bounded at --texture size) ---
+    texture = stitch_texture(zip_entries, total_cols, total_rows,
                              origin_e, origin_n_top, args.texture)
     tex_file = f"{name}_texture.png"
     texture.save(os.path.join(out_dir, tex_file))
     print(f"Texture saved: {texture.size[0]}x{texture.size[1]} px")
 
-    # --- Build mesh ---
-    print(f"\nBuilding mesh (step={args.step}, vscale={args.vscale})...")
-    vertices, uvs, faces = build_mesh(grid, args.step, args.vscale)
-    print(f"Mesh: {len(vertices):,} vertices, {len(faces):,} triangles")
+    # --- Write OBJ (streamed tile-by-tile) ---
+    print(f"\nStreaming mesh (step={args.step}, vscale={args.vscale})...")
+    mtl_path = _write_mtl(out_dir, name, tex_file)
+    n_verts, n_faces = stream_obj(
+        out_dir, name, headers, tile_index, origin_e, origin_n_top,
+        total_rows, total_cols, args.step, args.vscale, tex_file)
+    print(f"Saved: {mtl_path}")
 
-    # --- Write OBJ ---
-    write_obj(out_dir, name, vertices, uvs, faces, tex_file)
-
-    # --- Summary ---
-    elev_min, elev_max = float(np.min(grid)), float(np.max(grid))
     print(f"\nDone!")
     print(f"  Output:    {out_dir}/")
-    print(f"  Elevation: {elev_min:.0f} m .. {elev_max:.0f} m")
-    print(f"  Mesh:      {len(vertices):,} vertices, {len(faces):,} triangles")
+    print(f"  Mesh:      {n_verts:,} vertices, {n_faces:,} triangles")
     print(f"  Texture:   {texture.size[0]}x{texture.size[1]} px")
     print(f"\nOpen {name}.obj in Blender, MeshLab, or any 3D viewer.")
 

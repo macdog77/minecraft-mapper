@@ -30,8 +30,11 @@ from generate import (
     CELL_SIZE_M,
     MAP_ZERO_Y,
     Y_MAX,
+    _load_tile_elev,
+    _tile_global_offset,
+    compute_global_extent,
     discover_zips,
-    load_elevation_grid,
+    scan_headers,
 )
 from locate import bng_to_tile
 
@@ -49,10 +52,21 @@ def main():
     zip_entries = discover_zips(args.input)
     print(f"Found {len(zip_entries)} tiles.")
 
-    grid, origin_easting, origin_northing_top = load_elevation_grid(zip_entries)
+    # Stream tile-by-tile so a whole-UK scan doesn't load the full grid.
+    headers = scan_headers(zip_entries)
+    origin_easting, origin_northing_top, _total_rows, _total_cols = compute_global_extent(headers)
 
-    max_elev = float(np.max(grid))
-    max_row, max_col = np.unravel_index(int(np.argmax(grid)), grid.shape)
+    max_elev = float("-inf")
+    max_row = max_col = 0
+    for key, (hdr, zp) in headers.items():
+        _nrows, _ncols, arr = _load_tile_elev(zp)
+        tile_max = float(arr.max())
+        if tile_max > max_elev:
+            max_elev = tile_max
+            local_r, local_c = np.unravel_index(int(arr.argmax()), arr.shape)
+            core_row0, core_col0 = _tile_global_offset(hdr, origin_easting, origin_northing_top)
+            max_row = core_row0 + int(local_r)
+            max_col = core_col0 + int(local_c)
 
     # BNG coordinates of the highest cell (cell centre)
     east  = origin_easting       + (max_col + 0.5) * CELL_SIZE_M

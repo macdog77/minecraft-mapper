@@ -26,8 +26,14 @@ import zipfile
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(__file__))
-from heightmap import parse_asc, make_heightmap
-from mesh import _find_tiffs, QUADRANTS, TILE_PX as TIFF_TILE_PX, SEA_COLOUR
+from minecraft_uk.osdata.asc import parse_asc
+from minecraft_uk.osdata.tiff import (
+    QUADRANTS,
+    SEA_COLOUR,
+    TILE_PX as TIFF_TILE_PX,
+    find_tiffs,
+)
+from minecraft_uk.rendering.heightmap import make_heightmap
 
 TILE_PX = 200          # cells per tile side (1 px per 50 m cell)
 BEN_NEVIS_M = 1345.0
@@ -107,7 +113,7 @@ def stitch_tiff_layer(tiles, e_min, n_max, img_w, img_h):
     for i, ((e, n), (_, region_code)) in enumerate(sorted(tiles.items()), 1):
         print(f"  [{i:3d}/{total}] TIFF {region_code.upper()}{e}{n}",
               end="\r", flush=True)
-        tiffs = _find_tiffs(region_code, e, n)
+        tiffs = find_tiffs(region_code, e, n)
         if not tiffs:
             continue
 

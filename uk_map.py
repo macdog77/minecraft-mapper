@@ -24,7 +24,9 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from mesh import (_MAJOR_REVERSE, _MINOR_LETTERS, QUAD_PX, SEA_COLOUR, TILE_DIR)
+from minecraft_uk.common.paths import TILES_ROOT
+from minecraft_uk.osdata.bng import region_origin, square_code_at
+from minecraft_uk.osdata.tiff import QUAD_PX, SEA_COLOUR
 
 SQUARE_M = 100_000   # 100 km BNG square
 TILE_M   = 10_000    # 10 km elevation tile
@@ -38,34 +40,13 @@ QUAD_XY = {"SW": (0, 0), "SE": (QUAD_M, 0),
 GRID_COLOUR  = (220, 30, 30)
 LABEL_COLOUR = (220, 30, 30)
 
-_MAJOR_FORWARD = {(c, r): k for k, (c, r) in _MAJOR_REVERSE.items()}
-
-
-def region_origin(code):
-    """SW corner (easting, northing) in metres of a 100 km BNG square."""
-    mc, mr = _MAJOR_REVERSE[code[0].upper()]
-    mi = _MINOR_LETTERS.index(code[1].upper())
-    return mc * 500_000 + (mi % 5) * 100_000, mr * 500_000 + (4 - mi // 5) * 100_000
-
-
-def square_code_at(e, n):
-    """Return the 2-letter BNG code for the 100 km square containing (e, n), or None."""
-    if not (0 <= e < 1_000_000 and 0 <= n < 1_500_000):
-        return None
-    major = _MAJOR_FORWARD.get((e // 500_000, n // 500_000))
-    if major is None:
-        return None
-    col = (e % 500_000) // 100_000
-    row_from_south = (n % 500_000) // 100_000
-    return major + _MINOR_LETTERS[(4 - row_from_south) * 5 + col]
-
 
 def discover_all_tiffs():
-    """Yield (region, e, n, quadrant, path) for every TIFF under TILE_DIR."""
-    if not os.path.isdir(TILE_DIR):
-        raise FileNotFoundError(f"Tiles directory not found: {TILE_DIR}")
-    for region in sorted(os.listdir(TILE_DIR)):
-        rdir = os.path.join(TILE_DIR, region)
+    """Yield (region, e, n, quadrant, path) for every TIFF under TILES_ROOT."""
+    if not os.path.isdir(TILES_ROOT):
+        raise FileNotFoundError(f"Tiles directory not found: {TILES_ROOT}")
+    for region in sorted(os.listdir(TILES_ROOT)):
+        rdir = os.path.join(TILES_ROOT, region)
         if not os.path.isdir(rdir):
             continue
         for fname in sorted(os.listdir(rdir)):
@@ -119,7 +100,7 @@ def main():
 
     tiffs = list(discover_all_tiffs())
     if not tiffs:
-        print(f"No TIFFs found in {TILE_DIR}")
+        print(f"No TIFFs found in {TILES_ROOT}")
         sys.exit(1)
     regions_present = {t[0] for t in tiffs}
     print(f"Found {len(tiffs)} quadrant TIFFs across {len(regions_present)} regions.")

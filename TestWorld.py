@@ -29,7 +29,7 @@ from amulet.api.chunk import Chunk
 from amulet.level.formats.anvil_world import AnvilFormat
 
 sys.path.insert(0, os.path.dirname(__file__))
-from generate import (
+from minecraft_uk.minecraft.constants import (
     ARRAY_HEIGHT,
     ARRAY_OFFSET,
     DIMENSION,
@@ -37,10 +37,9 @@ from generate import (
     MC_VERSION_ID,
     Y_MAX,
     Y_MIN,
-    _make_palette,
-    patch_level_dat,
-    write_entity_files,
 )
+from minecraft_uk.minecraft.palettes import make_block_palette
+from minecraft_uk.minecraft.world import patch_level_dat, write_entity_files
 
 
 def main():
@@ -69,7 +68,7 @@ def main():
     patch_level_dat(out_path, "TestWorld_Tower", 10, 65, 8, void=False)
 
     level = amulet.load_level(out_path)
-    block_uni = _make_palette(level)
+    block_uni = make_block_palette(level)
 
     # Resolve a gold_block universal for the markers
     ver = level.level_wrapper.translation_manager.get_version(MC_VERSION_ID, MC_VERSION)

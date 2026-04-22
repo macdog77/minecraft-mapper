@@ -26,17 +26,16 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from generate import (
+from minecraft_uk.minecraft.constants import MAP_ZERO_Y, Y_MAX
+from minecraft_uk.osdata.bng import bng_to_tile
+from minecraft_uk.osdata.discovery import discover_zips
+from minecraft_uk.osdata.tiles import (
     CELL_SIZE_M,
-    MAP_ZERO_Y,
-    Y_MAX,
-    _load_tile_elev,
-    _tile_global_offset,
     compute_global_extent,
-    discover_zips,
+    load_tile_elev,
     scan_headers,
+    tile_global_offset,
 )
-from locate import bng_to_tile
 
 
 def main():
@@ -59,12 +58,12 @@ def main():
     max_elev = float("-inf")
     max_row = max_col = 0
     for key, (hdr, zp) in headers.items():
-        _nrows, _ncols, arr = _load_tile_elev(zp)
+        _nrows, _ncols, arr = load_tile_elev(zp)
         tile_max = float(arr.max())
         if tile_max > max_elev:
             max_elev = tile_max
             local_r, local_c = np.unravel_index(int(arr.argmax()), arr.shape)
-            core_row0, core_col0 = _tile_global_offset(hdr, origin_easting, origin_northing_top)
+            core_row0, core_col0 = tile_global_offset(hdr, origin_easting, origin_northing_top)
             max_row = core_row0 + int(local_r)
             max_col = core_col0 + int(local_c)
 

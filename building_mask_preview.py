@@ -34,13 +34,13 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from generate import (
-    _is_building_color,
-    CELL_SIZE_M,
-    TIFF_PX_PER_M,
+from minecraft_uk.osdata.features import BUILDING_SUBCELL_M
+from minecraft_uk.osdata.tiff import (
     TIFF_BUILDING_THRESHOLD,
-    BUILDING_SUBCELL_M,
+    TIFF_PX_PER_M,
+    is_building_color as _is_building_color,
 )
+from minecraft_uk.osdata.tiles import CELL_SIZE_M
 
 
 def parse_channel(spec, default_tol):
